@@ -1,0 +1,34 @@
+# Environment files
+.env
+.env.local
+api_key.txt
+*.key
+access_token.json
+*access_token*
+*_token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Data Files & Artifacts (Keep repo lightweight for fast cloud build)
+*.parquet
+*.csv
+*.png
+logs/
+*.log
+tmp/
+temp/

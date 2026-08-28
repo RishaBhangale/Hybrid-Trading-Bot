@@ -1,0 +1,22 @@
+# Core Trading
+kiteconnect>=4.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+pytz>=2023.3
+pyarrow>=12.0.0
+
+# Web Framework
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+
+# Auto Login (Headless HTTP + TOTP)
+pyotp>=2.9.0
+requests>=2.31.0
+
+# Telegram Notifications
+urllib3>=1.26.0
+
+# Robustness & Analytics
+scikit-learn>=1.2.0
+matplotlib>=3.7.0
+seaborn>=0.12.0

@@ -1,0 +1,162 @@
+//@version=5
+indicator("AGY Index Master Suite (Filtered ORB + 50/200 EMA Trend Following)", overlay=true, max_lines_count=500, max_boxes_count=500)
+
+// ==============================================================================
+// 1. INPUT CONFIGURATION
+// ==============================================================================
+grp_mode    = "Strategy Mode Selector"
+strat_mode  = input.string("Combined Hybrid", "Select Active Strategy", options=["1. Filtered 15M ORB", "2. Futures Trend Following", "Combined Hybrid"], group=grp_mode)
+
+grp_orb     = "Strategy 1: Filtered ORB (15M)"
+min_rvol    = input.float(1.2, "Min Volume Ratio vs 20-MA", step=0.1, group=grp_orb)
+min_orb_w   = input.float(0.20, "Min Range / ATR Ratio (Avoid Dead Chop)", step=0.05, group=grp_orb)
+max_orb_w   = input.float(0.65, "Max Range / ATR Ratio (Avoid Exhaustion)", step=0.05, group=grp_orb)
+
+grp_trend   = "Strategy 2: Futures Trend Following"
+don_len     = input.int(20, "Donchian Breakout Channel Length", group=grp_trend)
+atr_mult    = input.float(2.0, "Trailing Stop ATR Multiplier", step=0.1, group=grp_trend)
+
+// ==============================================================================
+// 2. INDICATORS & MARKET REGIME
+// ==============================================================================
+// 14-Period ATR
+atr_val = ta.atr(14)
+
+// 20, 50, and 200 EMAs
+ema_20  = ta.ema(close, 20)
+ema_50  = ta.ema(close, 50)
+ema_200 = ta.ema(close, 200)
+
+plot(ema_50,  "EMA 50",  color=color.blue,   linewidth=2)
+plot(ema_200, "EMA 200", color=color.orange, linewidth=2)
+
+// 20-Period Donchian Breakout Channels
+don_high = ta.highest(high, don_len)[1]
+don_low  = ta.lowest(low, don_len)[1]
+plot(don_high, "Donchian High", color=color.new(color.green, 60), style=plot.style_stepline)
+plot(don_low,  "Donchian Low",  color=color.new(color.red, 60),   style=plot.style_stepline)
+
+// Volume 20-MA
+vol_ma20 = ta.sma(volume, 20)[1]
+
+// Intraday VWAP
+v_val = ta.vwap(hlc3)
+plot(v_val, "Intraday VWAP", color=color.new(color.purple, 30), linewidth=1, style=plot.style_circles)
+
+// ==============================================================================
+// 3. 15-MINUTE OPENING RANGE BREAKOUT ENGINE (09:15 - 09:30)
+// ==============================================================================
+is_new_day = ta.change(time("D")) != 0
+in_orb_window = (time(timeframe.period, "0915-0930") != 0)
+
+var float orb_high = na
+var float orb_low = na
+
+if is_new_day
+    orb_high := na
+    orb_low := na
+
+if in_orb_window
+    orb_high := na(orb_high) ? high : math.max(orb_high, high)
+    orb_low  := na(orb_low)  ? low  : math.min(orb_low, low)
+
+plot(orb_high, "ORB High (09:15-09:30)", color=color.teal, linewidth=2, style=plot.style_linebr)
+plot(orb_low,  "ORB Low (09:15-09:30)",  color=color.maroon, linewidth=2, style=plot.style_linebr)
+
+orb_width = orb_high - orb_low
+orb_vol_ok = (volume > min_rvol * vol_ma20)
+orb_width_ok = (orb_width >= min_orb_w * atr_val) and (orb_width <= max_orb_w * atr_val)
+
+// ==============================================================================
+// 4. SIGNAL EXECUTION & TRAILING ENGINES
+// ==============================================================================
+is_entry_time = (time(timeframe.period, "0930-1400") != 0)
+is_eod_exit   = (time(timeframe.period, "1515-1530") != 0)
+
+var string pos_side = "NONE"
+var string pos_source = ""
+var float pos_sl = na
+
+bool sig_orb_long  = (strat_mode != "2. Futures Trend Following") and (close > orb_high) and orb_vol_ok and orb_width_ok and (close > ema_200)
+bool sig_orb_short = (strat_mode != "2. Futures Trend Following") and (close < orb_low)  and orb_vol_ok and orb_width_ok and (close < ema_200)
+
+bool sig_trend_long  = (strat_mode != "1. Filtered 15M ORB") and (ema_50 > ema_200) and (close > don_high)
+bool sig_trend_short = (strat_mode != "1. Filtered 15M ORB") and (ema_50 < ema_200) and (close < don_low)
+
+bool enter_long = false
+bool enter_short = false
+bool exit_signal = false
+string exit_desc = ""
+
+// State Machine
+if pos_side == "NONE"
+    if is_entry_time
+        if sig_orb_long
+            pos_side := "LONG"
+            pos_source := "ORB 15M"
+            pos_sl := low - (0.5 * atr_val)
+            enter_long := true
+        else if sig_orb_short
+            pos_side := "SHORT"
+            pos_source := "ORB 15M"
+            pos_sl := high + (0.5 * atr_val)
+            enter_short := true
+        else if sig_trend_long
+            pos_side := "LONG"
+            pos_source := "Trend Follow"
+            pos_sl := close - (atr_mult * atr_val)
+            enter_long := true
+        else if sig_trend_short
+            pos_side := "SHORT"
+            pos_source := "Trend Follow"
+            pos_sl := close + (atr_mult * atr_val)
+            enter_short := true
+
+else if pos_side == "LONG"
+    if is_eod_exit
+        exit_signal := true
+        exit_desc := "EOD 15:15"
+        pos_side := "NONE"
+    else if low <= pos_sl
+        exit_signal := true
+        exit_desc := "Trailing SL Hit"
+        pos_side := "NONE"
+    else
+        // Update ATR Trailing Stop
+        new_sl = high - (atr_mult * atr_val)
+        pos_sl := math.max(pos_sl, new_sl)
+
+else if pos_side == "SHORT"
+    if is_eod_exit
+        exit_signal := true
+        exit_desc := "EOD 15:15"
+        pos_side := "NONE"
+    else if high >= pos_sl
+        exit_signal := true
+        exit_desc := "Trailing SL Hit"
+        pos_side := "NONE"
+    else
+        new_sl = low + (atr_mult * atr_val)
+        pos_sl := math.min(pos_sl, new_sl)
+
+// ==============================================================================
+// 5. VISUAL MARKERS & CHART DASHBOARD
+// ==============================================================================
+plotshape(enter_long, "ENTER LONG", shape.labelup, location.belowbar, color=color.green, text="LONG\n" + pos_source, textcolor=color.white, size=size.normal)
+plotshape(enter_short, "ENTER SHORT", shape.labeldown, location.abovebar, color=color.red, text="SHORT\n" + pos_source, textcolor=color.white, size=size.normal)
+plotshape(exit_signal, "EXIT POSITION", shape.xcross, location.abovebar, color=color.orange, text="EXIT\n" + exit_desc, textcolor=color.white, size=size.small)
+
+// Trailing SL Line
+plot(pos_side != "NONE" ? pos_sl : na, "Active Trailing SL", color=color.fuchsia, linewidth=2, style=plot.style_linebr)
+
+// Chart Information Table
+var table tb = table.new(position.top_right, 4, 4, bgcolor=color.new(color.black, 30), border_color=color.gray, border_width=1)
+if barstate.islast
+    table.cell(tb, 0, 0, "Index Strategy", bgcolor=color.navy, text_color=color.white)
+    table.cell(tb, 1, 0, strat_mode, bgcolor=color.navy, text_color=color.white)
+    table.cell(tb, 0, 1, "EMA 50 / 200 Bias", text_color=color.white)
+    table.cell(tb, 1, 1, ema_50 > ema_200 ? "BULLISH (Long Only)" : "BEARISH (Short Only)", bgcolor=ema_50 > ema_200 ? color.green : color.red, text_color=color.white)
+    table.cell(tb, 0, 2, "ORB 15M Range", text_color=color.white)
+    table.cell(tb, 1, 2, orb_width_ok ? "VALID RANGE" : "FILTERED (Noise/Exhaustion)", bgcolor=orb_width_ok ? color.teal : color.maroon, text_color=color.white)
+    table.cell(tb, 0, 3, "Active Trade", text_color=color.white)
+    table.cell(tb, 1, 3, pos_side + (pos_side != "NONE" ? " (" + pos_source + ")" : ""), bgcolor=pos_side == "LONG" ? color.green : pos_side == "SHORT" ? color.red : color.gray, text_color=color.white)

@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: nifty-hybrid-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /ping
+    envVars:
+      # ===== Zerodha Kite Connect =====
+      - key: KITE_API_KEY
+        sync: false
+      - key: KITE_API_SECRET
+        sync: false
+      - key: KITE_USER_ID
+        sync: false
+      - key: KITE_PASSWORD
+        sync: false
+      - key: KITE_TOTP_SECRET
+        sync: false
+
+      # ===== Telegram Notifications =====
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+
+      # ===== Bot Configuration =====
+      - key: INDEX_STRATEGY
+        value: "HYBRID" # "HYBRID", "ORB_OPTIONS", "FUTURES_TREND"
+      - key: PAPER_TRADING
+        value: "true"
