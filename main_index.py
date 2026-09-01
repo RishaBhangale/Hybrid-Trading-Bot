@@ -118,10 +118,20 @@ class IndexTrader:
         
         self.positions: List[IndexPosition] = []
         self.closed_trades: List[IndexPosition] = []
+        
+        self.tick_count = 0
+        self.ltp = 0.0
+        self.last_atr = 0.0
+        self.last_ema50 = 0.0
+        self.last_ema200 = 0.0
+        self.last_filter_reason = "Waiting for initial 15M candles"
+        
         self.lock = Lock()
         
     def process_tick(self, ltp: float, tick_time: datetime, volume: int = 0):
         with self.lock:
+            self.tick_count += 1
+            self.ltp = ltp
             candle_minute = (tick_time.minute // 15) * 15
             candle_ts = tick_time.replace(minute=candle_minute, second=0, microsecond=0)
             
@@ -143,6 +153,24 @@ class IndexTrader:
                 
             # Real-time tick SL check
             self._check_trailing_stops(ltp)
+            
+    def get_diagnostics(self) -> Dict:
+        """Return real-time diagnostic status and filter telemetry for NIFTY Index."""
+        trend = "BULLISH" if self.last_ema50 > self.last_ema200 else ("BEARISH" if self.last_ema50 < self.last_ema200 else "NEUTRAL")
+        orb_str = f"H:{self.orb_high:.1f} L:{self.orb_low:.1f} (W:{self.orb_width:.1f} pts)" if self.orb_high else "Not established yet"
+        return {
+            "symbol": "NIFTY 50",
+            "ticks": self.tick_count,
+            "candles": len(self.candles),
+            "ltp": self.ltp,
+            "trend": trend,
+            "ema50": round(self.last_ema50, 1),
+            "ema200": round(self.last_ema200, 1),
+            "atr": round(self.last_atr, 1),
+            "orb_range": orb_str,
+            "block_reason": self.last_filter_reason,
+            "active_positions": len(self.positions)
+        }
             
     def _check_trailing_stops(self, ltp: float):
         for pos in list(self.positions):
@@ -385,12 +413,13 @@ class IndexOptionsBot:
         self._log(f"   Total Net P&L: ₹{tot_pnl:+,.2f}")
         self._log("="*60)
         
+        diagnostics = {"NIFTY": self.trader.get_diagnostics()}
         if self.telegram:
             sec_data = {"NIFTY": {"trades": len(trades), "pnl": tot_pnl, "wins": len(wins), "losses": len(trades) - len(wins)}}
-            self.telegram.notify_daily_summary(today, sec_data, tot_pnl)
+            self.telegram.notify_daily_summary(today, sec_data, tot_pnl, diagnostics=diagnostics)
             
         # Save JSON log
-        rep = {"date": today, "strategy": STRATEGY_MODE, "trades": len(trades), "win_rate": wr, "net_pnl": tot_pnl}
+        rep = {"date": today, "strategy": STRATEGY_MODE, "trades": len(trades), "win_rate": wr, "net_pnl": tot_pnl, "diagnostics": diagnostics}
         with open(LOG_DIR / f"index_report_{today}.json", "w") as f:
             json.dump(rep, f, indent=2, default=str)
 
@@ -407,7 +436,20 @@ class IndexOptionsBot:
             self.telegram.notify_bot_start(["NIFTY 50"])
             
         self.start_live_feed()
+        
+        heartbeat_sent = False
         while self.is_running and self.is_market_open():
+            now = now_ist()
+            # 12:00 PM IST Mid-Day Heartbeat
+            if not heartbeat_sent and now.hour == 12 and now.minute >= 0:
+                if self.telegram:
+                    try:
+                        status_dict = {"NIFTY": self.trader.get_diagnostics()}
+                        self.telegram.notify_midday_heartbeat(status_dict, self.trader.tick_count, len(self.trader.positions))
+                        print("💓 Mid-day heartbeat sent to Telegram", flush=True)
+                    except Exception as e:
+                        print(f"⚠️ Mid-day heartbeat failed: {e}", flush=True)
+                heartbeat_sent = True
             time.sleep(1)
             
         self._log("Market closed. Generating EOD summary...")

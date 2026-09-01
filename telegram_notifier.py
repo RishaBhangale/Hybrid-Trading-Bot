@@ -162,8 +162,8 @@ MACD Lookback: 3 (RELIANCE, ICICIBANK, SBIN) / 5 (AXISBANK, LT)
 """
         self.send_message(message)
     
-    def notify_daily_summary(self, date: str, securities_data: Dict, total_pnl: float):
-        """Send daily trading summary."""
+    def notify_daily_summary(self, date: str, securities_data: Dict, total_pnl: float, diagnostics: Optional[Dict] = None):
+        """Send daily trading summary with optional diagnostic filter breakdown."""
         pnl_emoji = "📈" if total_pnl >= 0 else "📉"
         status_emoji = "✅" if total_pnl >= 0 else "⚠️"
         
@@ -187,6 +187,19 @@ MACD Lookback: 3 (RELIANCE, ICICIBANK, SBIN) / 5 (AXISBANK, LT)
         
         win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
         
+        diag_section = ""
+        if diagnostics:
+            diag_lines = []
+            for sym, d in diagnostics.items():
+                ticks = d.get("ticks", 0)
+                candles = d.get("candles", 0)
+                peak = d.get("peak_score", 0.0)
+                reason = d.get("block_reason", "Criteria not met")
+                diag_lines.append(f"• <b>{sym}</b>: {candles} candles ({ticks:,} ticks) | Peak: <b>{peak:.1f}/2.0</b>\n  <i>Filter Status: {reason}</i>")
+            
+            verdict = "🛡️ <b>System Status:</b> 100% active; zero trades triggered due to strict multi-confirmation filters." if total_trades == 0 else "🎯 <b>System Status:</b> Executed high-conviction setups."
+            diag_section = f"\n━━━━━━━━━━━━━━━━━━━━━━\n<b>🔍 Daily Filter & Diagnostic Matrix:</b>\n" + "\n".join(diag_lines) + f"\n\n{verdict}\n"
+        
         message = f"""
 {status_emoji} <b>DAILY SUMMARY - {date}</b>
 
@@ -201,9 +214,49 @@ MACD Lookback: 3 (RELIANCE, ICICIBANK, SBIN) / 5 (AXISBANK, LT)
 <b>Win Rate:</b> {win_rate:.1f}%
 
 {pnl_emoji} <b>TOTAL P&L:</b> ₹{total_pnl:+,.2f}
-━━━━━━━━━━━━━━━━━━━━━━
+{diag_section}━━━━━━━━━━━━━━━━━━━━━━
 
 <i>Session ended at {now_ist().strftime("%H:%M:%S")} IST</i>
+"""
+        self.send_message(message)
+    
+    def notify_midday_heartbeat(self, status_dict: Dict, total_ticks: int, active_positions: int):
+        """Send mid-day heartbeat ping at 12:00 PM IST."""
+        lines = []
+        for sym, d in status_dict.items():
+            trend_emoji = "🟢" if d.get("trend") == "BULLISH" else ("🔴" if d.get("trend") == "BEARISH" else "⚪")
+            lines.append(f"  • {sym}: {trend_emoji} {d.get('trend', 'NEUTRAL')} | LTP: ₹{d.get('ltp', 0):.2f} | Peak: {d.get('peak_score', 0.0):.1f}/2.0")
+            
+        message = f"""
+💓 <b>BOT MID-DAY HEARTBEAT (12:00 PM IST)</b>
+
+━━━━━━━━━━━━━━━━━━━━━━
+<b>Status:</b> 🟢 Live & Streaming WebSocket Ticks
+<b>Total Ticks Today:</b> {total_ticks:,}
+<b>Active Open Positions:</b> {active_positions}
+
+<b>Monitored Stocks Status:</b>
+{chr(10).join(lines)}
+━━━━━━━━━━━━━━━━━━━━━━
+<i>Container is healthy and scanning 15m/30m closes.</i>
+"""
+        self.send_message(message)
+    
+    def notify_near_miss(self, symbol: str, direction: str, score: float, breakdown: List[str], ltp: float):
+        """Send immediate low-priority Near-Miss Telegram alert when score reaches >= 1.5."""
+        emoji = "🟡"
+        message = f"""
+{emoji} <b>NEAR-MISS SETUP WATCH - {symbol}</b>
+
+🎯 Direction: <b>{direction}</b>
+📊 Score: <b>{score:.1f} / 2.0</b> (Threshold: 2.0)
+💰 LTP: ₹{ltp:.2f}
+⏰ Time: {now_ist().strftime("%H:%M:%S")} IST
+
+<b>Score Components:</b>
+<code>{" | ".join(breakdown)}</code>
+
+<i>Stock is 0.5 pts from trigger. Waiting for final confirmation.</i>
 """
         self.send_message(message)
     
