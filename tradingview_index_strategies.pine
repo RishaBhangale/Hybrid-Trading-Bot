@@ -1,5 +1,5 @@
 //@version=5
-indicator("AGY Index Master Suite (Filtered ORB + 50/200 EMA Trend Following)", overlay=true, max_lines_count=500, max_boxes_count=500)
+indicator("AGY Index Master Suite (Filtered ORB + 50/200 EMA Trend Following + Risk/Reward Zones)", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
 
 // ==============================================================================
 // 1. INPUT CONFIGURATION
@@ -15,6 +15,10 @@ max_orb_w   = input.float(0.65, "Max Range / ATR Ratio (Avoid Exhaustion)", step
 grp_trend   = "Strategy 2: Futures Trend Following"
 don_len     = input.int(20, "Donchian Breakout Channel Length", group=grp_trend)
 atr_mult    = input.float(2.0, "Trailing Stop ATR Multiplier", step=0.1, group=grp_trend)
+
+grp_rr      = "Risk / Reward Visual Zones"
+show_rr     = input.bool(true, "Show Green Target & Red Stop-Loss Bands", group=grp_rr)
+rr_ratio    = input.float(1.5, "Risk-to-Reward Ratio", step=0.1, group=grp_rr)
 
 // ==============================================================================
 // 2. INDICATORS & MARKET REGIME
@@ -75,7 +79,9 @@ is_eod_exit   = (time(timeframe.period, "1515-1530") != 0)
 
 var string pos_side = "NONE"
 var string pos_source = ""
+var float pos_entry = na
 var float pos_sl = na
+var float pos_tp = na
 
 bool sig_orb_long  = (strat_mode != "2. Futures Trend Following") and (close > orb_high) and orb_vol_ok and orb_width_ok and (close > ema_200)
 bool sig_orb_short = (strat_mode != "2. Futures Trend Following") and (close < orb_low)  and orb_vol_ok and orb_width_ok and (close < ema_200)
@@ -88,38 +94,71 @@ bool enter_short = false
 bool exit_signal = false
 string exit_desc = ""
 
+// Risk / Reward Zone Handles
+var box box_tp = na
+var box box_sl = na
+var line line_entry = na
+var line line_tp = na
+var line line_sl = na
+
 // State Machine
 if pos_side == "NONE"
     if is_entry_time
-        if sig_orb_long
+        if sig_orb_long or sig_trend_long
             pos_side := "LONG"
-            pos_source := "ORB 15M"
-            pos_sl := low - (0.5 * atr_val)
+            pos_source := sig_orb_long ? "ORB 15M (Call Option)" : "Trend Follow (Futures)"
+            pos_entry := close
+            pos_sl := sig_orb_long ? low - (0.5 * atr_val) : close - (atr_mult * atr_val)
+            float risk = pos_entry - pos_sl
+            pos_tp := pos_entry + (risk * rr_ratio)
             enter_long := true
-        else if sig_orb_short
+            
+            if show_rr
+                box_tp := box.new(left=bar_index, top=pos_tp, right=bar_index + 1, bottom=pos_entry, 
+                                  bgcolor=color.new(color.green, 85), border_color=color.green, border_style=line.style_solid)
+                box_sl := box.new(left=bar_index, top=pos_entry, right=bar_index + 1, bottom=pos_sl, 
+                                  bgcolor=color.new(color.red, 85), border_color=color.red, border_style=line.style_solid)
+                line_entry := line.new(bar_index, pos_entry, bar_index + 1, pos_entry, color=color.gray, width=2, style=line.style_dashed)
+                line_tp    := line.new(bar_index, pos_tp, bar_index + 1, pos_tp, color=color.green, width=2, style=line.style_solid)
+                line_sl    := line.new(bar_index, pos_sl, bar_index + 1, pos_sl, color=color.red, width=2, style=line.style_solid)
+
+        else if sig_orb_short or sig_trend_short
             pos_side := "SHORT"
-            pos_source := "ORB 15M"
-            pos_sl := high + (0.5 * atr_val)
+            pos_source := sig_orb_short ? "ORB 15M (Put Option)" : "Trend Follow (Futures)"
+            pos_entry := close
+            pos_sl := sig_orb_short ? high + (0.5 * atr_val) : close + (atr_mult * atr_val)
+            float risk = pos_sl - pos_entry
+            pos_tp := pos_entry - (risk * rr_ratio)
             enter_short := true
-        else if sig_trend_long
-            pos_side := "LONG"
-            pos_source := "Trend Follow"
-            pos_sl := close - (atr_mult * atr_val)
-            enter_long := true
-        else if sig_trend_short
-            pos_side := "SHORT"
-            pos_source := "Trend Follow"
-            pos_sl := close + (atr_mult * atr_val)
-            enter_short := true
+            
+            if show_rr
+                box_tp := box.new(left=bar_index, top=pos_entry, right=bar_index + 1, bottom=pos_tp, 
+                                  bgcolor=color.new(color.green, 85), border_color=color.green, border_style=line.style_solid)
+                box_sl := box.new(left=bar_index, top=pos_sl, right=bar_index + 1, bottom=pos_entry, 
+                                  bgcolor=color.new(color.red, 85), border_color=color.red, border_style=line.style_solid)
+                line_entry := line.new(bar_index, pos_entry, bar_index + 1, pos_entry, color=color.gray, width=2, style=line.style_dashed)
+                line_tp    := line.new(bar_index, pos_tp, bar_index + 1, pos_tp, color=color.green, width=2, style=line.style_solid)
+                line_sl    := line.new(bar_index, pos_sl, bar_index + 1, pos_sl, color=color.red, width=2, style=line.style_solid)
 
 else if pos_side == "LONG"
+    if show_rr and not na(box_tp)
+        box.set_right(box_tp, bar_index)
+        box.set_right(box_sl, bar_index)
+        line.set_x2(line_entry, bar_index)
+        line.set_x2(line_tp, bar_index)
+        line.set_x2(line_sl, bar_index)
+
     if is_eod_exit
         exit_signal := true
         exit_desc := "EOD 15:15"
         pos_side := "NONE"
     else if low <= pos_sl
         exit_signal := true
-        exit_desc := "Trailing SL Hit"
+        exit_desc := "SL Hit"
+        pos_side := "NONE"
+    else if high >= pos_tp
+        exit_signal := true
+        exit_desc := "Target Hit"
         pos_side := "NONE"
     else
         // Update ATR Trailing Stop
@@ -127,13 +166,24 @@ else if pos_side == "LONG"
         pos_sl := math.max(pos_sl, new_sl)
 
 else if pos_side == "SHORT"
+    if show_rr and not na(box_tp)
+        box.set_right(box_tp, bar_index)
+        box.set_right(box_sl, bar_index)
+        line.set_x2(line_entry, bar_index)
+        line.set_x2(line_tp, bar_index)
+        line.set_x2(line_sl, bar_index)
+
     if is_eod_exit
         exit_signal := true
         exit_desc := "EOD 15:15"
         pos_side := "NONE"
     else if high >= pos_sl
         exit_signal := true
-        exit_desc := "Trailing SL Hit"
+        exit_desc := "SL Hit"
+        pos_side := "NONE"
+    else if low <= pos_tp
+        exit_signal := true
+        exit_desc := "Target Hit"
         pos_side := "NONE"
     else
         new_sl = low + (atr_mult * atr_val)

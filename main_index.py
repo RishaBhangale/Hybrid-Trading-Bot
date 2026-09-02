@@ -123,14 +123,117 @@ class IndexPosition:
 
 
 # ============================================================
+# PERSISTENT CAPITAL & RISK TRACKER
+# ============================================================
+class CapitalTracker:
+    """
+    Manages NIFTY Strategy trading capital (Strategy Ceiling ₹1,80,000),
+    passive income counter (overall P&L), and enforces margin/slot guardrails.
+    """
+    def __init__(self, base_capital: float = STRATEGY_CEILING,
+                 options_min_capital: float = 25000.0,
+                 futures_min_capital: float = 120000.0,
+                 state_file: Path = BASE_DIR / "capital_state.json",
+                 logger=print):
+        self.base_capital = base_capital
+        self.options_min_capital = options_min_capital
+        self.futures_min_capital = futures_min_capital
+        self.state_file = state_file
+        self.logger = logger
+        
+        self.session_capital = self.base_capital
+        self.overall_pnl = 0.0
+        self.load_state()
+
+    def load_state(self):
+        env_session = os.environ.get("SESSION_CAPITAL")
+        env_overall = os.environ.get("OVERALL_PNL")
+        
+        if env_session is not None or env_overall is not None:
+            if env_session:
+                try: self.session_capital = float(env_session)
+                except: pass
+            if env_overall:
+                try: self.overall_pnl = float(env_overall)
+                except: pass
+            self.logger(f"💼 Capital initialized from ENV: Session Capital=₹{self.session_capital:,.2f}, Overall P&L=₹{self.overall_pnl:,.2f}")
+            return
+            
+        if self.state_file.exists():
+            try:
+                data = json.loads(self.state_file.read_text())
+                self.session_capital = float(data.get("session_capital", self.base_capital))
+                self.overall_pnl = float(data.get("overall_pnl", 0.0))
+                self.logger(f"💼 Capital state loaded: Session Capital=₹{self.session_capital:,.2f}, Overall P&L=₹{self.overall_pnl:,.2f}")
+            except Exception as e:
+                self.logger(f"⚠️ Error reading capital_state.json: {e}. Defaulting to ₹{self.base_capital:,.2f}")
+                self.session_capital = self.base_capital
+                self.overall_pnl = 0.0
+        else:
+            self.session_capital = self.base_capital
+            self.overall_pnl = 0.0
+            self.save_state()
+
+    def save_state(self):
+        try:
+            data = {
+                "base_capital": self.base_capital,
+                "session_capital": self.session_capital,
+                "overall_pnl": self.overall_pnl,
+                "last_updated": now_ist().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            self.state_file.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            self.logger(f"⚠️ Error saving capital_state.json: {e}")
+
+    def can_open_position(self, instrument: str = "OPTIONS") -> tuple:
+        if self.session_capital <= 0:
+            return False, "Strategy capital is zero or depleted. Trading halted."
+        if instrument == "OPTIONS":
+            if self.session_capital < self.options_min_capital:
+                return False, f"Strategy capital (₹{self.session_capital:,.2f}) is below minimum required for Options (₹{self.options_min_capital:,.2f})."
+        elif instrument == "FUTURES":
+            if self.session_capital < self.futures_min_capital:
+                return False, f"Strategy capital (₹{self.session_capital:,.2f}) is below required margin for Futures (₹{self.futures_min_capital:,.2f})."
+        return True, "OK"
+
+    def end_day(self, day_net_pnl: float) -> dict:
+        capital_used = self.session_capital
+        self.overall_pnl += day_net_pnl
+        
+        is_profit = day_net_pnl >= 0
+        if is_profit:
+            next_day_capital = self.base_capital
+            capital_remaining = self.session_capital + day_net_pnl
+        else:
+            next_day_capital = max(0.0, self.session_capital + day_net_pnl)
+            capital_remaining = next_day_capital
+            
+        summary = {
+            "capital_used": capital_used,
+            "day_pnl": day_net_pnl,
+            "is_profit": is_profit,
+            "capital_remaining": capital_remaining,
+            "next_day_capital": next_day_capital,
+            "overall_pnl": self.overall_pnl,
+            "base_capital": self.base_capital
+        }
+        
+        self.session_capital = next_day_capital
+        self.save_state()
+        return summary
+
+
+# ============================================================
 # INDEX TRADER ENGINE
 # ============================================================
 class IndexTrader:
-    def __init__(self, logger, kite=None, nfo_df=None, telegram=None):
+    def __init__(self, logger, kite=None, nfo_df=None, telegram=None, capital_tracker=None):
         self.logger = logger
         self.kite = kite
         self.nfo_df = nfo_df
         self.telegram = telegram
+        self.capital_tracker = capital_tracker
         
         self.lot_size = 65
         self.strike_gap = 50.0
@@ -276,11 +379,25 @@ class IndexTrader:
             has_trend = any(p.strategy == "2_FUTURES_TREND" for p in self.positions)
             if not has_trend and datetime.strptime("09:30", "%H:%M").time() <= c_time <= datetime.strptime("14:30", "%H:%M").time():
                 if self.last_ema50 > self.last_ema200 and c_close > don_high:
+                    if self.capital_tracker:
+                        can_open, reason = self.capital_tracker.can_open_position("FUTURES")
+                        if not can_open:
+                            self.logger(f"⚠️ [NIFTY Futures LONG] Entry blocked: {reason}")
+                            if self.telegram and (self.capital_tracker.session_capital < self.capital_tracker.futures_min_capital or self.capital_tracker.session_capital <= 0):
+                                self.telegram.notify_capital_alert("NIFTY FUTURES", self.capital_tracker.session_capital, self.capital_tracker.futures_min_capital, self.capital_tracker.overall_pnl, reason)
+                            return
                     sl = c_close - (2.0 * self.last_atr)
                     pos = IndexPosition("2_FUTURES_TREND", "LONG", "FUTURES", "NIFTY_FUT", c_close, sl, self.lot_size, c_ts, c_close)
                     self.positions.append(pos)
                     self._notify_entry(pos, f"NIFTY Futures LONG (EMA Bull + Donchian Breakout > {don_high:.1f})")
                 elif self.last_ema50 < self.last_ema200 and c_close < don_low:
+                    if self.capital_tracker:
+                        can_open, reason = self.capital_tracker.can_open_position("FUTURES")
+                        if not can_open:
+                            self.logger(f"⚠️ [NIFTY Futures SHORT] Entry blocked: {reason}")
+                            if self.telegram and (self.capital_tracker.session_capital < self.capital_tracker.futures_min_capital or self.capital_tracker.session_capital <= 0):
+                                self.telegram.notify_capital_alert("NIFTY FUTURES", self.capital_tracker.session_capital, self.capital_tracker.futures_min_capital, self.capital_tracker.overall_pnl, reason)
+                            return
                     sl = c_close + (2.0 * self.last_atr)
                     pos = IndexPosition("2_FUTURES_TREND", "SHORT", "FUTURES", "NIFTY_FUT", c_close, sl, self.lot_size, c_ts, c_close)
                     self.positions.append(pos)
@@ -288,6 +405,14 @@ class IndexTrader:
 
     def _enter_options_position(self, opt_type: str, spot: float):
         """Fetch live ATM option contract from Kite and enter."""
+        if self.capital_tracker:
+            can_open, reason = self.capital_tracker.can_open_position("OPTIONS")
+            if not can_open:
+                self.logger(f"⚠️ [NIFTY ATM {opt_type}] Entry blocked: {reason}")
+                if self.telegram and (self.capital_tracker.session_capital < self.capital_tracker.options_min_capital or self.capital_tracker.session_capital <= 0):
+                    self.telegram.notify_capital_alert("NIFTY OPTIONS", self.capital_tracker.session_capital, self.capital_tracker.options_min_capital, self.capital_tracker.overall_pnl, reason)
+                return
+
         atm_strike = round(spot / self.strike_gap) * self.strike_gap
         today = date.today()
         opts = self.nfo_df[(self.nfo_df['name'] == 'NIFTY') &
@@ -364,7 +489,8 @@ class IndexOptionsBot:
         self.telegram = TelegramNotifier() if TELEGRAM_AVAILABLE else None
         self.nfo_df: Optional[pd.DataFrame] = None
         self.spot_token = 256265
-        self.trader = IndexTrader(self._log, None, None, self.telegram)
+        self.capital_tracker = CapitalTracker(base_capital=STRATEGY_CEILING, options_min_capital=25000.0, futures_min_capital=120000.0, logger=self._log)
+        self.trader = IndexTrader(self._log, None, None, self.telegram, self.capital_tracker)
         self.log_file = LOG_DIR / f"index_{now_ist().strftime('%Y%m%d')}.log"
 
     def _log(self, msg: str):
@@ -467,13 +593,22 @@ class IndexOptionsBot:
         wins = [t for t in trades if t.net_pnl > 0]
         
         diagnostics = {"NIFTY": self.trader.get_diagnostics()}
+        
+        # Process EOD Capital and Risk
+        cap_summary = self.capital_tracker.end_day(tot_pnl)
+        
         if self.telegram:
             sec_data = {"NIFTY": {"trades": len(trades), "pnl": tot_pnl, "wins": len(wins), "losses": len(trades) - len(wins)}}
-            self.telegram.notify_daily_summary(today, sec_data, tot_pnl, diagnostics=diagnostics)
+            self.telegram.notify_daily_summary(today, sec_data, tot_pnl, diagnostics=diagnostics, capital_summary=cap_summary)
             
         rep = {
-            "date": today, "strategy": STRATEGY_MODE, "capital": {"total_equity": TOTAL_EQUITY, "ceiling": STRATEGY_CEILING, "reserve": PROTECTED_RESERVE},
-            "trades": len(trades), "net_pnl": tot_pnl, "diagnostics": diagnostics
+            "date": today,
+            "strategy": STRATEGY_MODE,
+            "capital_summary": cap_summary,
+            "capital": {"total_equity": TOTAL_EQUITY, "ceiling": STRATEGY_CEILING, "reserve": PROTECTED_RESERVE},
+            "trades": len(trades),
+            "net_pnl": tot_pnl,
+            "diagnostics": diagnostics
         }
         with open(LOG_DIR / f"index_report_{today}.json", "w") as f:
             json.dump(rep, f, indent=2, default=str)
@@ -481,7 +616,7 @@ class IndexOptionsBot:
     def run(self):
         self.is_running = True
         print("\n" + "="*70)
-        print(f"🚀 NIFTY MASTER HYBRID ENGINE (Corpus: ₹{TOTAL_EQUITY:,.0f} | Ceiling: ₹{STRATEGY_CEILING:,.0f})")
+        print(f"🚀 NIFTY MASTER HYBRID ENGINE (Capital: ₹{self.capital_tracker.session_capital:,.0f} | Overall P&L: ₹{self.capital_tracker.overall_pnl:+,.0f})")
         print("="*70)
         
         if not self.authenticate(): return
@@ -489,7 +624,7 @@ class IndexOptionsBot:
         self.fetch_historical()
         
         if self.telegram:
-            self.telegram.notify_bot_start(["NIFTY 50"])
+            self.telegram.notify_bot_start(["NIFTY 50"], capital_tracker=self.capital_tracker)
             
         self.start_live_feed()
         

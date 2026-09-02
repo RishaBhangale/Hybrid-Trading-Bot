@@ -157,7 +157,7 @@ def run_single_trading_day() -> bool:
         bot_status["candles_loaded"] = len(bot_instance.trader.candles)
 
         if bot_instance.telegram:
-            bot_instance.telegram.notify_bot_start(["NIFTY 50 (Master Hybrid)"])
+            bot_instance.telegram.notify_bot_start(["NIFTY 50 (Master Hybrid)"], capital_tracker=bot_instance.capital_tracker)
 
         bot_instance.start_live_feed()
 
