@@ -152,25 +152,43 @@ def run_single_trading_day() -> bool:
     bot_status["market_status"] = "Market Open"
     
     try:
+        bot_instance.load_market_metadata()
         bot_instance.fetch_historical()
         bot_status["candles_loaded"] = len(bot_instance.trader.candles)
-        
+
         if bot_instance.telegram:
             bot_instance.telegram.notify_bot_start(["NIFTY 50 (Master Hybrid)"])
-            
+
         bot_instance.start_live_feed()
-        
-        while bot_instance.is_running and bot_instance.is_market_open():
+
+        heartbeat_sent = False
+        # Run until 15:35 IST regardless of WebSocket timing (prevents early exit at 09:15)
+        session_end = now_ist().replace(hour=15, minute=35, second=0, microsecond=0)
+
+        while now_ist() < session_end:
+            now = now_ist()
             bot_status["active_positions"] = len(bot_instance.trader.positions)
             bot_status["daily_pnl"] = sum(t.net_pnl for t in bot_instance.trader.closed_trades)
+
+            # Mid-Day Heartbeat at 12:00 PM IST (fires once)
+            if not heartbeat_sent and now.hour == 12 and now.minute >= 0:
+                if bot_instance.telegram:
+                    status_dict = {"NIFTY": bot_instance.trader.get_diagnostics()}
+                    bot_instance.telegram.notify_midday_heartbeat(
+                        status_dict,
+                        bot_instance.trader.tick_count,
+                        len(bot_instance.trader.positions)
+                    )
+                heartbeat_sent = True
+
             time.sleep(5)
-            
+
         add_log("🏁 Market closed. Concluding session...")
         bot_instance.generate_report()
         bot_status["status"] = "day_complete"
         bot_status["market_status"] = "Market Closed"
         return True
-        
+
     except Exception as e:
         add_log(f"❌ Session error: {e}")
         traceback.print_exc()
