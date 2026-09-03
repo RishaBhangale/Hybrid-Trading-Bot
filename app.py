@@ -162,6 +162,7 @@ def run_single_trading_day() -> bool:
         bot_instance.start_live_feed()
 
         heartbeat_sent = False
+        eod_summary_sent = False
         # Run until 15:35 IST regardless of WebSocket timing (prevents early exit at 09:15)
         session_end = now_ist().replace(hour=15, minute=35, second=0, microsecond=0)
 
@@ -181,10 +182,22 @@ def run_single_trading_day() -> bool:
                     )
                 heartbeat_sent = True
 
+            # EOD Summary at 15:31 IST (fires once, inside loop — survives loop exit or restart)
+            if not eod_summary_sent and now.hour == 15 and now.minute >= 31:
+                add_log("🏁 15:31 IST hit — generating EOD summary inside loop...")
+                try:
+                    bot_instance.generate_report()
+                    eod_summary_sent = True
+                except Exception as eod_err:
+                    add_log(f"⚠️ EOD summary error: {eod_err}")
+
             time.sleep(5)
 
-        add_log("🏁 Market closed. Concluding session...")
-        bot_instance.generate_report()
+        add_log("🏁 Market session window closed.")
+        # Ensure EOD summary fires even if 15:31 trigger was missed
+        if not eod_summary_sent:
+            add_log("🏁 Sending delayed EOD summary...")
+            bot_instance.generate_report()
         bot_status["status"] = "day_complete"
         bot_status["market_status"] = "Market Closed"
         return True
@@ -192,6 +205,14 @@ def run_single_trading_day() -> bool:
     except Exception as e:
         add_log(f"❌ Session error: {e}")
         traceback.print_exc()
+        # Still try to send EOD summary on crash after 15:30
+        try:
+            now = now_ist()
+            if now.hour >= 15 and now.minute >= 30 and bot_instance:
+                add_log("🏁 Crash after market close — sending EOD summary...")
+                bot_instance.generate_report()
+        except Exception:
+            pass
         bot_status["status"] = "error"
         bot_status["error"] = str(e)
         return False
