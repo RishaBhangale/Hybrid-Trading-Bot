@@ -175,6 +175,7 @@ class CapitalTracker:
             self.save_state()
 
     def save_state(self):
+        # 1. Save to local file (fast, for same-container restarts)
         try:
             data = {
                 "base_capital": self.base_capital,
@@ -185,6 +186,39 @@ class CapitalTracker:
             self.state_file.write_text(json.dumps(data, indent=2))
         except Exception as e:
             self.logger(f"⚠️ Error saving capital_state.json: {e}")
+
+        # 2. Push to Render env vars (survives redeployments / new containers)
+        self._push_to_render_env()
+
+    def _push_to_render_env(self):
+        """Persist SESSION_CAPITAL and OVERALL_PNL as Render env vars so they
+        survive container teardowns and new deployments."""
+        api_key = os.environ.get("RENDER_API_KEY")
+        service_id = os.environ.get("RENDER_SERVICE_ID")
+        if not api_key or not service_id:
+            return  # Not on Render or keys not configured — silently skip
+        try:
+            import urllib.request
+            url = f"https://api.render.com/v1/services/{service_id}/env-vars"
+            payload = json.dumps([
+                {"key": "SESSION_CAPITAL", "value": str(self.session_capital)},
+                {"key": "OVERALL_PNL",     "value": str(self.overall_pnl)},
+            ]).encode()
+            req = urllib.request.Request(
+                url, data=payload, method="PUT",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                }
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status in (200, 201):
+                    self.logger(f"💾 Capital persisted to Render env vars — Session: ₹{self.session_capital:,.2f} | Overall P&L: ₹{self.overall_pnl:+,.2f}")
+                else:
+                    self.logger(f"⚠️ Render env update returned status {resp.status}")
+        except Exception as e:
+            self.logger(f"⚠️ Could not push capital to Render env vars: {e}")
 
     def can_open_position(self, instrument: str = "OPTIONS") -> tuple:
         if self.session_capital <= 0:
