@@ -597,7 +597,7 @@ class IndexOptionsBot:
     def start_live_feed(self):
         creds = load_credentials()
         self.ticker = KiteTicker(creds["api_key"], self.kite.access_token)
-        self._last_tick_time = now_ist()
+        self._last_tick_time = None  # Set only when first real tick arrives
         
         def on_connect(ws, resp):
             ws.subscribe([self.spot_token])
