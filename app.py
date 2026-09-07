@@ -182,6 +182,17 @@ def run_single_trading_day() -> bool:
                     )
                 heartbeat_sent = True
 
+            # Tick-Starvation Watchdog — restart WebSocket if no ticks for 5 mins during market hours
+            if bot_instance.is_market_open():
+                last_tick = getattr(bot_instance, "_last_tick_time", None)
+                if last_tick and (now - last_tick).total_seconds() > 300:
+                    add_log("⚠️ No ticks for 5+ minutes during market hours — restarting WebSocket feed...")
+                    try:
+                        bot_instance._restart_ticker()
+                        add_log("✅ WebSocket feed restarted by watchdog.")
+                    except Exception as wd_err:
+                        add_log(f"❌ Watchdog restart failed: {wd_err}")
+
             # EOD Summary at 15:31 IST (fires once, inside loop — survives loop exit or restart)
             if not eod_summary_sent and now.hour == 15 and now.minute >= 31:
                 add_log("🏁 15:31 IST hit — generating EOD summary inside loop...")
