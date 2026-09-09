@@ -160,46 +160,66 @@ def run_single_trading_day() -> bool:
                     )
                 heartbeat_sent = True
 
-            # 2. Tick-Starvation Watchdog — only fires after first real tick arrives,
-            #    then restarts if >5 mins of silence during market hours
+            # 2. Tick-Starvation Watchdog (two cases handled):
+            #    A) Had ticks before, now silent for >5 mins → restart
+            #    B) Never got any tick, and feed has been up for >10 mins → restart
             if bot_instance.is_market_open():
                 last_tick = getattr(bot_instance, "_last_tick_time", None)
+                feed_start = getattr(bot_instance, "_feed_start_time", None)
+
+                needs_restart = False
+                restart_reason = ""
+
                 if last_tick is not None and (now - last_tick).total_seconds() > 300:
-                    add_log("⚠️ No ticks for 5+ minutes during market hours — restarting WebSocket feed...")
+                    needs_restart = True
+                    restart_reason = "no ticks for 5+ minutes (feed dropped)"
+                elif last_tick is None and feed_start is not None and (now - feed_start).total_seconds() > 600:
+                    needs_restart = True
+                    restart_reason = "no ticks received in first 10 mins (feed never connected)"
+
+                if needs_restart:
+                    add_log(f"Watchdog triggered: {restart_reason} — restarting WebSocket...")
                     try:
                         bot_instance._restart_ticker()
-                        add_log("✅ WebSocket feed restarted by watchdog.")
+                        add_log("WebSocket feed restarted by watchdog.")
                     except Exception as wd_err:
-                        add_log(f"❌ Watchdog restart failed: {wd_err}")
+                        add_log(f"Watchdog restart failed: {wd_err}")
 
             # 3. EOD Summary at 15:31 IST (fires once, inside loop — survives loop exit or restart)
             if not eod_summary_sent and now.hour == 15 and now.minute >= 31:
-                add_log("🏁 15:31 IST hit — generating EOD summary inside loop...")
+                add_log("15:31 IST — generating EOD summary...")
                 try:
                     bot_instance.generate_report()
                     eod_summary_sent = True
                 except Exception as eod_err:
-                    add_log(f"⚠️ EOD summary error: {eod_err}")
+                    add_log(f"EOD summary error: {eod_err}")
 
             time.sleep(5)
 
-        add_log("🏁 Market session window closed.")
-        # Ensure EOD summary fires even if 15:31 trigger was missed
+        add_log("Market session window closed.")
         if not eod_summary_sent:
-            add_log("🏁 Sending delayed EOD summary...")
+            add_log("Sending delayed EOD summary...")
             bot_instance.generate_report()
         bot_status["status"] = "day_complete"
         bot_status["market_status"] = "Market Closed"
         return True
 
     except Exception as e:
-        add_log(f"❌ Session error: {e}")
+        add_log(f"Session error: {e}")
         traceback.print_exc()
-        # Still try to send EOD summary on crash after 15:30
+        # Notify via Telegram if possible so user knows something failed
+        try:
+            if bot_instance and bot_instance.telegram:
+                bot_instance.telegram.send_message(
+                    f"<b>NIFTY Bot Session Error</b>\n\n"
+                    f"<code>{str(e)[:300]}</code>\n\n"
+                    f"<i>Bot will retry in 15 minutes.</i>"
+                )
+        except Exception:
+            pass
         try:
             now = now_ist()
             if now.hour >= 15 and now.minute >= 30 and bot_instance:
-                add_log("🏁 Crash after market close — sending EOD summary...")
                 bot_instance.generate_report()
         except Exception:
             pass

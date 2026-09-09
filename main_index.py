@@ -602,6 +602,7 @@ class IndexOptionsBot:
         def on_connect(ws, resp):
             ws.subscribe([self.spot_token])
             ws.set_mode(ws.MODE_FULL, [self.spot_token])
+            self._feed_start_time = now_ist()  # Mark when feed actually connected
             self._log(f"✅ WebSocket connected — subscribed to NIFTY 50 (Token: {self.spot_token}).")
             
         def on_ticks(ws, ticks):
