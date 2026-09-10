@@ -192,31 +192,30 @@ class CapitalTracker:
 
     def _push_to_render_env(self):
         """Persist SESSION_CAPITAL and OVERALL_PNL as Render env vars so they
-        survive container teardowns and new deployments."""
+        survive container teardowns and new deployments.
+        Uses per-key PUT to avoid wiping other env vars."""
         api_key = os.environ.get("RENDER_API_KEY")
         service_id = os.environ.get("RENDER_SERVICE_ID")
         if not api_key or not service_id:
             return  # Not on Render or keys not configured — silently skip
         try:
             import urllib.request
-            url = f"https://api.render.com/v1/services/{service_id}/env-vars"
-            payload = json.dumps([
-                {"key": "SESSION_CAPITAL", "value": str(self.session_capital)},
-                {"key": "OVERALL_PNL",     "value": str(self.overall_pnl)},
-            ]).encode()
-            req = urllib.request.Request(
-                url, data=payload, method="PUT",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                }
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status in (200, 201):
-                    self.logger(f"💾 Capital persisted to Render env vars — Session: ₹{self.session_capital:,.2f} | Overall P&L: ₹{self.overall_pnl:+,.2f}")
-                else:
-                    self.logger(f"⚠️ Render env update returned status {resp.status}")
+            base_url = f"https://api.render.com/v1/services/{service_id}/env-vars"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+            # Update each key individually — does NOT touch other env vars
+            for key, value in [("SESSION_CAPITAL", str(self.session_capital)),
+                               ("OVERALL_PNL", str(self.overall_pnl))]:
+                payload = json.dumps({"value": value}).encode()
+                req = urllib.request.Request(
+                    f"{base_url}/{key}", data=payload, method="PUT",
+                    headers=headers
+                )
+                urllib.request.urlopen(req, timeout=10)
+            self.logger(f"💾 Capital persisted to Render — Session: ₹{self.session_capital:,.2f} | P&L: ₹{self.overall_pnl:+,.2f}")
         except Exception as e:
             self.logger(f"⚠️ Could not push capital to Render env vars: {e}")
 
