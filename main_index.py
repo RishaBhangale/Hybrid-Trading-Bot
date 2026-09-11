@@ -48,6 +48,7 @@ except ImportError:
     TelegramNotifier = None
 
 from auto_login import KiteAutoLogin, load_credentials
+from execution_engine import ExecutionEngine
 
 # ============================================================
 # CONFIGURATION & CAPITAL ALLOCATION BUCKETS
@@ -59,6 +60,7 @@ LOG_DIR.mkdir(exist_ok=True)
 TOTAL_EQUITY = 300000.0          # ₹3,00,000 Total Account Equity
 STRATEGY_CEILING = 180000.0      # ₹1,80,000 Strategy Allocation Ceiling (Max Normal Deployment)
 PROTECTED_RESERVE = 120000.0     # ₹1,20,000 Protected Reserve (Never intentionally deploy)
+DAILY_LOSS_LIMIT = 15000.0       # ₹15,000 Daily Loss Limit
 
 STRATEGY_MODE = os.environ.get("INDEX_STRATEGY", "HYBRID").upper()  # "ORB_OPTIONS", "FUTURES_TREND", "HYBRID"
 PAPER_TRADING = os.environ.get("PAPER_TRADING", "true").lower() == "true"
@@ -140,6 +142,8 @@ class CapitalTracker:
         self.futures_min_capital = futures_min_capital
         self.state_file = state_file
         self.logger = logger
+        self.lock = Lock()
+        self.daily_realized_pnl = 0.0
         
         self.session_capital = self.base_capital
         self.overall_pnl = 0.0
@@ -193,11 +197,18 @@ class CapitalTracker:
     def _push_to_render_env(self):
         """Persist SESSION_CAPITAL and OVERALL_PNL as Render env vars so they
         survive container teardowns and new deployments.
-        Uses per-key PUT to avoid wiping other env vars."""
+        Uses GET-merge-PUT pattern to preserve all existing env vars."""
+        import math
         api_key = os.environ.get("RENDER_API_KEY")
         service_id = os.environ.get("RENDER_SERVICE_ID")
         if not api_key or not service_id:
             return  # Not on Render or keys not configured — silently skip
+        
+        # Guard against persisting NaN or Inf
+        if not math.isfinite(self.session_capital) or not math.isfinite(self.overall_pnl):
+            self.logger("⚠️ Refusing to persist non-finite capital values to Render")
+            return
+        
         try:
             import urllib.request
             base_url = f"https://api.render.com/v1/services/{service_id}/env-vars"
@@ -206,29 +217,47 @@ class CapitalTracker:
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             }
-            # Update each key individually — does NOT touch other env vars
-            for key, value in [("SESSION_CAPITAL", str(self.session_capital)),
-                               ("OVERALL_PNL", str(self.overall_pnl))]:
-                payload = json.dumps({"value": value}).encode()
-                req = urllib.request.Request(
-                    f"{base_url}/{key}", data=payload, method="PUT",
-                    headers=headers
-                )
-                urllib.request.urlopen(req, timeout=10)
+            
+            # 1. GET all existing env vars
+            get_req = urllib.request.Request(base_url, method="GET", headers=headers)
+            with urllib.request.urlopen(get_req, timeout=10) as resp:
+                existing = json.loads(resp.read().decode())
+            
+            # 2. Build env var dict from existing, update our keys
+            env_dict = {}
+            for item in existing:
+                env_dict[item["envVar"]["key"]] = item["envVar"]["value"]
+            
+            env_dict["SESSION_CAPITAL"] = str(self.session_capital)
+            env_dict["OVERALL_PNL"] = str(self.overall_pnl)
+            
+            # 3. PUT full list back (preserves other env vars)
+            payload = json.dumps([{"key": k, "value": v} for k, v in env_dict.items()]).encode()
+            put_req = urllib.request.Request(base_url, data=payload, method="PUT", headers=headers)
+            urllib.request.urlopen(put_req, timeout=10)
+            
             self.logger(f"💾 Capital persisted to Render — Session: ₹{self.session_capital:,.2f} | P&L: ₹{self.overall_pnl:+,.2f}")
         except Exception as e:
             self.logger(f"⚠️ Could not push capital to Render env vars: {e}")
 
     def can_open_position(self, instrument: str = "OPTIONS") -> tuple:
-        if self.session_capital <= 0:
-            return False, "Strategy capital is zero or depleted. Trading halted."
-        if instrument == "OPTIONS":
-            if self.session_capital < self.options_min_capital:
-                return False, f"Strategy capital (₹{self.session_capital:,.2f}) is below minimum required for Options (₹{self.options_min_capital:,.2f})."
-        elif instrument == "FUTURES":
-            if self.session_capital < self.futures_min_capital:
-                return False, f"Strategy capital (₹{self.session_capital:,.2f}) is below required margin for Futures (₹{self.futures_min_capital:,.2f})."
-        return True, "OK"
+        with self.lock:
+            if self.session_capital <= 0:
+                return False, "Strategy capital is zero or depleted. Trading halted."
+            if self.daily_realized_pnl <= -DAILY_LOSS_LIMIT:
+                return False, f"Daily loss limit hit: ₹{self.daily_realized_pnl:,.2f} exceeds -₹{DAILY_LOSS_LIMIT:,.2f}. Trading halted for today."
+            if instrument == "OPTIONS":
+                if self.session_capital < self.options_min_capital:
+                    return False, f"Strategy capital (₹{self.session_capital:,.2f}) is below minimum required for Options (₹{self.options_min_capital:,.2f})."
+            elif instrument == "FUTURES":
+                if self.session_capital < self.futures_min_capital:
+                    return False, f"Strategy capital (₹{self.session_capital:,.2f}) is below required margin for Futures (₹{self.futures_min_capital:,.2f})."
+            return True, "OK"
+
+    def record_trade_pnl(self, pnl: float):
+        """Record a closed trade's P&L for daily loss limit tracking."""
+        with self.lock:
+            self.daily_realized_pnl += pnl
 
     def end_day(self, day_net_pnl: float) -> dict:
         capital_used = self.session_capital
@@ -261,12 +290,14 @@ class CapitalTracker:
 # INDEX TRADER ENGINE
 # ============================================================
 class IndexTrader:
-    def __init__(self, logger, kite=None, nfo_df=None, telegram=None, capital_tracker=None):
+    def __init__(self, logger, kite=None, nfo_df=None, telegram=None, capital_tracker=None, bot_controller=None, execution_engine=None):
         self.logger = logger
         self.kite = kite
         self.nfo_df = nfo_df
         self.telegram = telegram
         self.capital_tracker = capital_tracker
+        self.bot_controller = bot_controller
+        self.execution_engine = execution_engine
         
         self.lot_size = 65
         self.strike_gap = 50.0
@@ -292,6 +323,7 @@ class IndexTrader:
         self.last_ema200 = 0.0
         self.last_filter_reason = "Waiting for initial 15M candles"
         self.lock = Lock()
+        self.last_option_ltp: Dict[str, float] = {}  # Updated from WebSocket ticks
         
     def process_tick(self, ltp: float, tick_time: datetime, volume: int = 0):
         with self.lock:
@@ -321,13 +353,10 @@ class IndexTrader:
     def _check_trailing_stops(self, ltp: float):
         for pos in list(self.positions):
             if pos.instrument == "OPTIONS":
-                try:
-                    quote = self.kite.ltp([f"NFO:{pos.tradingsymbol}"])
-                    opt_ltp = quote.get(f"NFO:{pos.tradingsymbol}", {}).get("last_price", 0.0)
-                    if opt_ltp > 0 and opt_ltp <= pos.trailing_sl:
-                        self._close_position(pos, opt_ltp, "SL_HIT")
-                except Exception:
-                    pass
+                opt_ltp = self.last_option_ltp.get(pos.tradingsymbol, 0.0)
+                if opt_ltp > 0 and opt_ltp <= pos.trailing_sl:
+                    self.logger(f"🔔 [NIFTY SL] Option LTP ₹{opt_ltp:.2f} ≤ SL ₹{pos.trailing_sl:.2f}")
+                    self._close_position(pos, opt_ltp, "SL_HIT")
             elif pos.instrument == "FUTURES":
                 if pos.position_type == "LONG" and ltp <= pos.trailing_sl:
                     self._close_position(pos, pos.trailing_sl, "SL_HIT")
@@ -420,7 +449,17 @@ class IndexTrader:
                                 self.telegram.notify_capital_alert("NIFTY FUTURES", self.capital_tracker.session_capital, self.capital_tracker.futures_min_capital, self.capital_tracker.overall_pnl, reason)
                             return
                     sl = c_close - (2.0 * self.last_atr)
-                    pos = IndexPosition("2_FUTURES_TREND", "LONG", "FUTURES", "NIFTY_FUT", c_close, sl, self.lot_size, c_ts, c_close)
+                    entry_p = c_close
+                    qty = self.lot_size
+                    if self.execution_engine:
+                        res = self.execution_engine.place_entry_order("NIFTY_FUT", qty, entry_p, "BUY")
+                        if res["status"] != "COMPLETE":
+                            self.logger(f"❌ [NIFTY Futures LONG] Order failed: {res.get('error', res['status'])}")
+                            return
+                        entry_p = res["fill_price"]
+                        qty = res.get("fill_qty", qty)
+
+                    pos = IndexPosition("2_FUTURES_TREND", "LONG", "FUTURES", "NIFTY_FUT", entry_p, sl, qty, c_ts, c_close)
                     self.positions.append(pos)
                     self._notify_entry(pos, f"NIFTY Futures LONG (EMA Bull + Donchian Breakout > {don_high:.1f})")
                 elif self.last_ema50 < self.last_ema200 and c_close < don_low:
@@ -432,7 +471,17 @@ class IndexTrader:
                                 self.telegram.notify_capital_alert("NIFTY FUTURES", self.capital_tracker.session_capital, self.capital_tracker.futures_min_capital, self.capital_tracker.overall_pnl, reason)
                             return
                     sl = c_close + (2.0 * self.last_atr)
-                    pos = IndexPosition("2_FUTURES_TREND", "SHORT", "FUTURES", "NIFTY_FUT", c_close, sl, self.lot_size, c_ts, c_close)
+                    entry_p = c_close
+                    qty = self.lot_size
+                    if self.execution_engine:
+                        res = self.execution_engine.place_entry_order("NIFTY_FUT", qty, entry_p, "SELL")
+                        if res["status"] != "COMPLETE":
+                            self.logger(f"❌ [NIFTY Futures SHORT] Order failed: {res.get('error', res['status'])}")
+                            return
+                        entry_p = res["fill_price"]
+                        qty = res.get("fill_qty", qty)
+
+                    pos = IndexPosition("2_FUTURES_TREND", "SHORT", "FUTURES", "NIFTY_FUT", entry_p, sl, qty, c_ts, c_close)
                     self.positions.append(pos)
                     self._notify_entry(pos, f"NIFTY Futures SHORT (EMA Bear + Donchian Breakdown < {don_low:.1f})")
 
@@ -455,15 +504,39 @@ class IndexTrader:
         if opts.empty: return
         contract = opts.iloc[0]
         tsym = contract['tradingsymbol']
+        token = int(contract['instrument_token'])
         lot = int(contract['lot_size'])
         
         quote = self.kite.ltp([f"NFO:{tsym}"])
         live_price = quote.get(f"NFO:{tsym}", {}).get("last_price", 0.0)
-        if live_price <= 0: live_price = 50.0
+        if live_price <= 0:
+            self.logger(f"⚠️ [NIFTY ATM {opt_type}] LTP unavailable for {tsym} — aborting entry (refusing to fabricate price)")
+            return
+        
+        # Execute via ExecutionEngine
+        if self.execution_engine:
+            res = self.execution_engine.place_entry_order(tsym, lot, live_price, "BUY")
+            if res["status"] != "COMPLETE":
+                self.logger(f"❌ [NIFTY ATM {opt_type}] Order failed: {res.get('error', res['status'])}")
+                return
+            live_price = res["fill_price"]
+            lot = res.get("fill_qty", lot)
         
         sl = max(0.50, live_price * 0.75)  # 25% option stop-loss
         pos = IndexPosition("1B_ORB_OPTIONS", opt_type, "OPTIONS", tsym, live_price, sl, lot, now_ist(), spot)
         self.positions.append(pos)
+        
+        # Subscribe option token to WebSocket for real-time SL
+        self.last_option_ltp[tsym] = live_price
+        if self.bot_controller and self.bot_controller.ticker:
+            try:
+                self.bot_controller.ticker.subscribe([token])
+                self.bot_controller.ticker.set_mode(self.bot_controller.ticker.MODE_FULL, [token])
+                self.bot_controller.token_to_symbol[token] = f"OPT_{tsym}"
+                self.logger(f"📡 Subscribed NIFTY option token {token} ({tsym}) to WebSocket")
+            except Exception as e:
+                self.logger(f"⚠️ Failed to subscribe option token: {e}")
+
         self._notify_entry(pos, f"NIFTY ATM {opt_type} ({tsym} @ ₹{live_price:.2f})")
 
     def _notify_entry(self, pos: IndexPosition, desc: str):
@@ -480,8 +553,19 @@ class IndexTrader:
         if pos not in self.positions: return
         self.positions.remove(pos)
         
+        # Execute exit via ExecutionEngine
+        if self.execution_engine:
+            txn = "SELL" if pos.instrument == "OPTIONS" or pos.position_type == "LONG" else "BUY"
+            res = self.execution_engine.place_exit_order(pos.tradingsymbol, pos.quantity, txn, exit_price)
+            if res["status"] == "COMPLETE" and res["fill_price"] > 0:
+                exit_price = res["fill_price"]
+        
         pos.close(exit_price, reason)
         self.closed_trades.append(pos)
+        
+        # Record trade P&L to capital tracker
+        if self.capital_tracker:
+            self.capital_tracker.record_trade_pnl(pos.net_pnl)
         
         emoji = "✅" if pos.net_pnl > 0 else "🛑"
         print(f"\n{emoji} [NIFTY EXIT] {pos.tradingsymbol} - {reason}", flush=True)
@@ -490,6 +574,19 @@ class IndexTrader:
         
         if self.telegram:
             self.telegram.notify_trade_exit("NIFTY", pos.position_type, pos.spot_at_entry, pos.entry_price, exit_price, pos.net_pnl, reason)
+
+        # Unsubscribe option token from WebSocket
+        if pos.instrument == "OPTIONS" and self.bot_controller and self.bot_controller.ticker:
+            try:
+                # Find token for this tradingsymbol
+                for tok, sym in list(self.bot_controller.token_to_symbol.items()):
+                    if sym == f"OPT_{pos.tradingsymbol}":
+                        self.bot_controller.ticker.unsubscribe([tok])
+                        self.bot_controller.token_to_symbol.pop(tok, None)
+                        break
+                self.last_option_ltp.pop(pos.tradingsymbol, None)
+            except Exception:
+                pass
 
     def get_diagnostics(self) -> Dict:
         trend = "BULLISH" if self.last_ema50 > self.last_ema200 else ("BEARISH" if self.last_ema50 < self.last_ema200 else "NEUTRAL")
@@ -522,8 +619,11 @@ class IndexOptionsBot:
         self.telegram = TelegramNotifier() if TELEGRAM_AVAILABLE else None
         self.nfo_df: Optional[pd.DataFrame] = None
         self.spot_token = 256265
+        self.token_to_symbol: Dict[int, str] = {self.spot_token: "NIFTY"}
+        self._needs_restart = False
         self.capital_tracker = CapitalTracker(base_capital=STRATEGY_CEILING, options_min_capital=25000.0, futures_min_capital=120000.0, logger=self._log)
-        self.trader = IndexTrader(self._log, None, None, self.telegram, self.capital_tracker)
+        self.execution_engine = ExecutionEngine(paper_trading=PAPER_TRADING, logger=self._log)
+        self.trader = IndexTrader(self._log, None, None, self.telegram, self.capital_tracker, self, self.execution_engine)
         self.log_file = LOG_DIR / f"index_{now_ist().strftime('%Y%m%d')}.log"
 
     def _log(self, msg: str):
@@ -548,12 +648,14 @@ class IndexOptionsBot:
             try:
                 prof = self.kite.profile()
                 self._log(f"✅ Reusing valid access token. Logged in as: {prof.get('user_name')}")
+                self.execution_engine.kite = self.kite
                 return True
             except Exception:
                 pass
         token = auto_login.login()
         if token:
             self.kite = auto_login.kite
+            self.execution_engine.kite = self.kite
             self._log("✅ Fresh auto-login successful!")
             return True
         return False
@@ -573,6 +675,7 @@ class IndexOptionsBot:
         spot_match = df_nse[df_nse['tradingsymbol'] == 'NIFTY 50']
         if not spot_match.empty:
             self.spot_token = int(spot_match.iloc[0]['instrument_token'])
+            self.token_to_symbol[self.spot_token] = "NIFTY"
             
         nifty_futs = self.nfo_df[(self.nfo_df['name'] == 'NIFTY') & (self.nfo_df['instrument_type'] == 'FUT')]
         if not nifty_futs.empty:
@@ -588,6 +691,7 @@ class IndexOptionsBot:
         to_d = now_ist()
         from_d = to_d - timedelta(days=10)
         data = self.kite.historical_data(self.spot_token, from_date=from_d, to_date=to_d, interval="15minute")
+        self.trader.candles = []  # Clear on retry to avoid duplicates
         for c in data[-50:]:
             self.trader.candles.append({
                 "timestamp": c["date"], "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"], "volume": c.get("volume", 0)
@@ -599,18 +703,25 @@ class IndexOptionsBot:
         self._last_tick_time = None  # Set only when first real tick arrives
         
         def on_connect(ws, resp):
-            ws.subscribe([self.spot_token])
-            ws.set_mode(ws.MODE_FULL, [self.spot_token])
+            tokens = list(self.token_to_symbol.keys())
+            ws.subscribe(tokens)
+            ws.set_mode(ws.MODE_FULL, tokens)
             self._feed_start_time = now_ist()  # Mark when feed actually connected
-            self._log(f"✅ WebSocket connected — subscribed to NIFTY 50 (Token: {self.spot_token}).")
+            self._log(f"✅ WebSocket connected — subscribed to {len(tokens)} tokens.")
             
         def on_ticks(ws, ticks):
             self._last_tick_time = now_ist()
             for t in ticks:
-                if t.get("instrument_token") == self.spot_token:
+                tok = t.get("instrument_token")
+                if tok in self.token_to_symbol:
+                    sym = self.token_to_symbol[tok]
                     ltp = t.get("last_price")
                     vol = t.get("volume_traded", 0)
-                    if ltp:
+                    if sym.startswith("OPT_"):
+                        opt_tsym = sym[4:]
+                        if ltp:
+                            self.trader.last_option_ltp[opt_tsym] = ltp
+                    elif sym == "NIFTY" and ltp:
                         self.trader.process_tick(ltp, now_ist(), vol)
 
         def on_error(ws, code, reason):
@@ -625,11 +736,8 @@ class IndexOptionsBot:
             self._log(f"🔄 WebSocket reconnecting... attempt #{attempt}")
 
         def on_noreconnect(ws):
-            self._log("❌ WebSocket exhausted all reconnect attempts — restarting ticker now.")
-            try:
-                self._restart_ticker()
-            except Exception as e:
-                self._log(f"❌ Ticker restart failed: {e}")
+            self._log("❌ WebSocket exhausted all reconnect attempts — setting restart flag.")
+            self._needs_restart = True
 
         self.ticker.on_connect = on_connect
         self.ticker.on_ticks = on_ticks
@@ -640,7 +748,8 @@ class IndexOptionsBot:
         self.ticker.connect(threaded=True)
 
     def _restart_ticker(self):
-        """Hard-restart the KiteTicker when auto-reconnect is exhausted."""
+        """Hard-restart the KiteTicker when auto-reconnect is exhausted. Main thread only."""
+        self._needs_restart = False
         try:
             if self.ticker:
                 self.ticker.close()
@@ -657,6 +766,14 @@ class IndexOptionsBot:
 
     def generate_report(self):
         today = now_ist().strftime("%Y-%m-%d")
+        # Ensure any remaining open positions are force-closed so their P&L enters EOD accounting
+        for pos in list(self.trader.positions):
+            self._log(f"⚠️ Force-closing open NIFTY position {pos.tradingsymbol} before EOD report")
+            try:
+                self.trader._close_position(pos, pos.entry_price, "EOD_REPORT_CLOSE")
+            except Exception as e:
+                self._log(f"❌ Failed to close {pos.tradingsymbol} before EOD report: {e}")
+
         trades = self.trader.closed_trades
         tot_pnl = sum(t.net_pnl for t in trades)
         wins = [t for t in trades if t.net_pnl > 0]
@@ -682,43 +799,16 @@ class IndexOptionsBot:
         with open(LOG_DIR / f"index_report_{today}.json", "w") as f:
             json.dump(rep, f, indent=2, default=str)
 
-    def run(self):
-        self.is_running = True
-        print("\n" + "="*70)
-        print(f"🚀 NIFTY MASTER HYBRID ENGINE (Capital: ₹{self.capital_tracker.session_capital:,.0f} | Overall P&L: ₹{self.capital_tracker.overall_pnl:+,.0f})")
-        print("="*70)
-        
-        if not self.authenticate(): return
-        self.load_market_metadata()
-        self.fetch_historical()
-        
-        if self.telegram:
-            self.telegram.notify_bot_start(["NIFTY 50"], capital_tracker=self.capital_tracker)
-            
-        self.start_live_feed()
-        
-        heartbeat_sent = False
-        while self.is_running and self.is_market_open():
-            now = now_ist()
-            if not heartbeat_sent and now.hour == 12 and now.minute >= 0:
-                if self.telegram:
-                    try:
-                        status_dict = {"NIFTY": self.trader.get_diagnostics()}
-                        self.telegram.notify_midday_heartbeat(status_dict, self.trader.tick_count, len(self.trader.positions))
-                    except Exception:
-                        pass
-                heartbeat_sent = True
-            time.sleep(1)
-            
-        self._log("Market closed. Generating EOD summary...")
-        self.generate_report()
-        if self.ticker: self.ticker.close()
-
     def stop(self):
         self.is_running = False
         self.stop_event.set()
+        if self.ticker:
+            try:
+                self.ticker.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
-    bot = IndexOptionsBot()
-    bot.run()
+    from app import run_trading_bot
+    run_trading_bot()

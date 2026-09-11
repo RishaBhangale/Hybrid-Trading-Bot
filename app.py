@@ -115,6 +115,7 @@ def run_single_trading_day() -> bool:
 
     bot_status["authenticated"] = True
     bot_status["status"] = "waiting_for_market"
+    bot_instance.is_running = True
 
     # Wait for market open
     now = now_ist()
@@ -129,6 +130,7 @@ def run_single_trading_day() -> bool:
     bot_status["status"] = "running"
     bot_status["market_status"] = "Market Open"
 
+    eod_summary_sent = False
     try:
         bot_instance.load_market_metadata()
         bot_instance.fetch_historical()
@@ -140,7 +142,6 @@ def run_single_trading_day() -> bool:
         bot_instance.start_live_feed()
 
         heartbeat_sent = False
-        eod_summary_sent = False
         # Run until 15:35 IST regardless of WebSocket timing (prevents early exit at 09:15)
         session_end = now_ist().replace(hour=15, minute=35, second=0, microsecond=0)
 
@@ -163,14 +164,17 @@ def run_single_trading_day() -> bool:
             # 2. Tick-Starvation Watchdog (two cases handled):
             #    A) Had ticks before, now silent for >5 mins → restart
             #    B) Never got any tick, and feed has been up for >10 mins → restart
+            #    C) on_noreconnect set _needs_restart flag → restart from main thread
             if bot_instance.is_market_open():
                 last_tick = getattr(bot_instance, "_last_tick_time", None)
                 feed_start = getattr(bot_instance, "_feed_start_time", None)
 
-                needs_restart = False
+                needs_restart = getattr(bot_instance, "_needs_restart", False)
                 restart_reason = ""
 
-                if last_tick is not None and (now - last_tick).total_seconds() > 300:
+                if needs_restart:
+                    restart_reason = "WebSocket exhausted reconnect attempts (flag set by on_noreconnect)"
+                elif last_tick is not None and (now - last_tick).total_seconds() > 300:
                     needs_restart = True
                     restart_reason = "no ticks for 5+ minutes (feed dropped)"
                 elif last_tick is None and feed_start is not None and (now - feed_start).total_seconds() > 600:
@@ -185,7 +189,16 @@ def run_single_trading_day() -> bool:
                     except Exception as wd_err:
                         add_log(f"Watchdog restart failed: {wd_err}")
 
-            # 3. EOD Summary at 15:31 IST (fires once, inside loop — survives loop exit or restart)
+            # 3. Time-based forced square-off at 15:20 IST (safety net)
+            if now.hour == 15 and now.minute >= 20 and now.minute < 25:
+                for pos in list(bot_instance.trader.positions):
+                    add_log(f"⏰ Force-closing open NIFTY position {pos.tradingsymbol} at 15:20 (time-based safety)")
+                    try:
+                        bot_instance.trader._close_position(pos, pos.entry_price, "EOD_FORCE_CLOSE")
+                    except Exception as sq_err:
+                        add_log(f"Force square-off error: {sq_err}")
+
+            # 4. EOD Summary at 15:31 IST (fires once, inside loop — survives loop exit or restart)
             if not eod_summary_sent and now.hour == 15 and now.minute >= 31:
                 add_log("15:31 IST — generating EOD summary...")
                 try:
@@ -197,6 +210,16 @@ def run_single_trading_day() -> bool:
             time.sleep(5)
 
         add_log("Market session window closed.")
+        
+        # Ticker cleanup — prevent thread leaks
+        bot_instance.is_running = False
+        try:
+            if bot_instance.ticker:
+                bot_instance.ticker.close()
+                add_log("WebSocket ticker closed cleanly.")
+        except Exception as tc_err:
+            add_log(f"Ticker cleanup warning: {tc_err}")
+
         if not eod_summary_sent:
             add_log("Sending delayed EOD summary...")
             bot_instance.generate_report()
@@ -207,6 +230,16 @@ def run_single_trading_day() -> bool:
     except Exception as e:
         add_log(f"Session error: {e}")
         traceback.print_exc()
+        # Clean up ticker on session error to prevent thread leaks
+        try:
+            if bot_instance:
+                bot_instance.is_running = False
+                if bot_instance.ticker:
+                    bot_instance.ticker.close()
+                    add_log("WebSocket ticker closed after session error.")
+        except Exception as cleanup_err:
+            add_log(f"Error during ticker cleanup: {cleanup_err}")
+
         # Notify via Telegram if possible so user knows something failed
         try:
             if bot_instance and bot_instance.telegram:
@@ -217,10 +250,13 @@ def run_single_trading_day() -> bool:
                 )
         except Exception:
             pass
+
+        # Try EOD summary only if market closed and summary wasn't sent yet
         try:
             now = now_ist()
-            if now.hour >= 15 and now.minute >= 30 and bot_instance:
+            if (now.hour > 15 or (now.hour == 15 and now.minute >= 30)) and bot_instance and not eod_summary_sent:
                 bot_instance.generate_report()
+                eod_summary_sent = True
         except Exception:
             pass
         bot_status["status"] = "error"
@@ -292,7 +328,9 @@ async def root():
     day = bot_status.get("trading_day", "N/A")
     pnl = bot_status.get("daily_pnl", 0.0)
     cap = bot_instance.capital_tracker.session_capital if bot_instance and hasattr(bot_instance, "capital_tracker") else STRATEGY_CEILING
-    return f"NIFTY Bot: {st} | Day: {day} | Capital: ₹{cap:,.0f} | Daily P&L: ₹{pnl:+,.2f}"
+    text = f"NIFTY Bot: {st} | Day: {day} | Capital: ₹{cap:,.0f} | Daily P&L: ₹{pnl:+,.2f}"
+    status_code = 503 if st in ("error", "error_retry") else 200
+    return PlainTextResponse(content=text, status_code=status_code)
 
 
 @app.get("/ping", response_class=PlainTextResponse)
