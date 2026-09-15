@@ -150,35 +150,46 @@ class CapitalTracker:
         self.load_state()
 
     def load_state(self):
-        env_session = os.environ.get("SESSION_CAPITAL")
-        env_overall = os.environ.get("OVERALL_PNL")
-        
-        if env_session is not None or env_overall is not None:
-            if env_session:
-                try: self.session_capital = float(env_session)
-                except: pass
-            if env_overall:
-                try: self.overall_pnl = float(env_overall)
-                except: pass
-            self.logger(f"💼 Capital initialized from ENV: Session Capital=₹{self.session_capital:,.2f}, Overall P&L=₹{self.overall_pnl:,.2f}")
-            return
-            
+        # 1. Prefer capital_state.json (local file updated by latest run/end_day)
+        loaded = False
         if self.state_file.exists():
             try:
                 data = json.loads(self.state_file.read_text())
                 self.session_capital = float(data.get("session_capital", self.base_capital))
                 self.overall_pnl = float(data.get("overall_pnl", 0.0))
-                self.logger(f"💼 Capital state loaded: Session Capital=₹{self.session_capital:,.2f}, Overall P&L=₹{self.overall_pnl:,.2f}")
+                self.logger(f"💼 Capital state loaded from file: Session Capital=₹{self.session_capital:,.2f}, Overall P&L=₹{self.overall_pnl:,.2f}")
+                loaded = True
             except Exception as e:
-                self.logger(f"⚠️ Error reading capital_state.json: {e}. Defaulting to ₹{self.base_capital:,.2f}")
-                self.session_capital = self.base_capital
-                self.overall_pnl = 0.0
-        else:
+                self.logger(f"⚠️ Error reading capital_state.json: {e}")
+
+        # 2. Fall back to environment variables (e.g. initial container deployment)
+        if not loaded:
+            env_session = os.environ.get("SESSION_CAPITAL")
+            env_overall = os.environ.get("OVERALL_PNL")
+            if env_session is not None or env_overall is not None:
+                if env_session:
+                    try: self.session_capital = float(env_session)
+                    except: pass
+                if env_overall:
+                    try: self.overall_pnl = float(env_overall)
+                    except: pass
+                self.logger(f"💼 Capital initialized from ENV: Session Capital=₹{self.session_capital:,.2f}, Overall P&L=₹{self.overall_pnl:,.2f}")
+                loaded = True
+
+        if not loaded:
             self.session_capital = self.base_capital
             self.overall_pnl = 0.0
             self.save_state()
+        else:
+            # Sync to os.environ so in-memory values match across components
+            os.environ["SESSION_CAPITAL"] = str(self.session_capital)
+            os.environ["OVERALL_PNL"] = str(self.overall_pnl)
 
     def save_state(self):
+        # Always sync to in-memory os.environ first
+        os.environ["SESSION_CAPITAL"] = str(self.session_capital)
+        os.environ["OVERALL_PNL"] = str(self.overall_pnl)
+
         # 1. Save to local file (fast, for same-container restarts)
         try:
             data = {
@@ -261,21 +272,30 @@ class CapitalTracker:
 
     def end_day(self, day_net_pnl: float) -> dict:
         capital_used = self.session_capital
+        
+        # New capital after today's P&L
+        new_capital = self.session_capital + day_net_pnl
         self.overall_pnl += day_net_pnl
         
-        is_profit = day_net_pnl >= 0
-        if is_profit:
+        # Two-tier principal recovery:
+        # Tier 1: If new_capital >= base_capital, base is restored and excess is reaped as profit
+        # Tier 2: If new_capital < base_capital, capital remains in deficit to recover next day
+        if new_capital >= self.base_capital:
             next_day_capital = self.base_capital
-            capital_remaining = self.session_capital + day_net_pnl
+            profit_reaped = new_capital - self.base_capital
+            is_base_restored = True
         else:
-            next_day_capital = max(0.0, self.session_capital + day_net_pnl)
-            capital_remaining = next_day_capital
+            next_day_capital = max(0.0, new_capital)
+            profit_reaped = 0.0
+            is_base_restored = False
             
         summary = {
             "capital_used": capital_used,
             "day_pnl": day_net_pnl,
-            "is_profit": is_profit,
-            "capital_remaining": capital_remaining,
+            "is_profit": day_net_pnl >= 0,
+            "is_base_restored": is_base_restored,
+            "profit_reaped": profit_reaped,
+            "capital_remaining": new_capital,
             "next_day_capital": next_day_capital,
             "overall_pnl": self.overall_pnl,
             "base_capital": self.base_capital
@@ -540,14 +560,16 @@ class IndexTrader:
         self._notify_entry(pos, f"NIFTY ATM {opt_type} ({tsym} @ ₹{live_price:.2f})")
 
     def _notify_entry(self, pos: IndexPosition, desc: str):
+        trade_amount = pos.quantity * pos.entry_price
         emoji = "🟢" if "LONG" in pos.position_type or "CALL" in pos.position_type else "🔴"
         print(f"\n{'='*60}", flush=True)
         print(f"{emoji} [NIFTY ENTRY] {pos.strategy} | {pos.tradingsymbol} | {desc}", flush=True)
         print(f"   Entry: ₹{pos.entry_price:.2f} | Initial SL: ₹{pos.initial_sl:.2f} | Qty: {pos.quantity}", flush=True)
+        print(f"   Amount Required: ₹{trade_amount:,.2f}", flush=True)
         print(f"{'='*60}\n", flush=True)
         
         if self.telegram:
-            self.telegram.notify_trade_entry("NIFTY", pos.position_type, pos.spot_at_entry, pos.entry_price, 0, pos.initial_sl, pos.quantity, f"{pos.strategy} ({desc})")
+            self.telegram.notify_trade_entry("NIFTY", pos.position_type, pos.spot_at_entry, pos.entry_price, 0, pos.initial_sl, pos.quantity, f"{pos.strategy} ({desc})", amount_required=trade_amount)
 
     def _close_position(self, pos: IndexPosition, exit_price: float, reason: str):
         if pos not in self.positions: return
@@ -701,6 +723,7 @@ class IndexOptionsBot:
         creds = load_credentials()
         self.ticker = KiteTicker(creds["api_key"], self.kite.access_token)
         self._last_tick_time = None  # Set only when first real tick arrives
+        self._feed_start_time = now_ist()  # Initialized at launch so watchdog can detect starvation
         
         def on_connect(ws, resp):
             tokens = list(self.token_to_symbol.keys())

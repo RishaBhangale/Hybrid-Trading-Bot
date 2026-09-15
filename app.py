@@ -177,12 +177,21 @@ def run_single_trading_day() -> bool:
                 elif last_tick is not None and (now - last_tick).total_seconds() > 300:
                     needs_restart = True
                     restart_reason = "no ticks for 5+ minutes (feed dropped)"
-                elif last_tick is None and feed_start is not None and (now - feed_start).total_seconds() > 600:
+                elif last_tick is None and feed_start is not None and (now - feed_start).total_seconds() > 300:
                     needs_restart = True
-                    restart_reason = "no ticks received in first 10 mins (feed never connected)"
+                    restart_reason = "no ticks received in first 5 mins (feed never connected)"
 
                 if needs_restart:
                     add_log(f"Watchdog triggered: {restart_reason} — restarting WebSocket...")
+                    try:
+                        if hasattr(bot_instance, "telegram") and bot_instance.telegram:
+                            bot_instance.telegram.send_message(
+                                f"⚠️ <b>WebSocket Watchdog Triggered</b>\n\n"
+                                f"<b>Reason:</b> {restart_reason}\n"
+                                f"Restarting WebSocket feed..."
+                            )
+                    except Exception as tg_err:
+                        add_log(f"Telegram watchdog alert failed: {tg_err}")
                     try:
                         bot_instance._restart_ticker()
                         add_log("WebSocket feed restarted by watchdog.")

@@ -80,7 +80,7 @@ class TelegramNotifier:
 
     def notify_trade_entry(self, security: str, option_type: str, strike: float,
                            entry_price: float, target: float, sl: float,
-                           quantity: int, signal: str):
+                           quantity: int, signal: str, amount_required: Optional[float] = None):
         """Notify new trade entry."""
         is_long = option_type.upper() in ("CE", "CALL") or "LONG" in signal.upper() or "CALL" in signal.upper()
         emoji = "🟢" if is_long else "🔴"
@@ -88,10 +88,13 @@ class TelegramNotifier:
         sl_pct = ((1 - sl / entry_price) * 100) if entry_price > 0 else 0
         inst_label = f"{option_type} {int(strike)}" if str(strike) != "0" else f"FUT {option_type}"
 
+        amt_line = f"<b>Amount Required:</b> ₹{amount_required:,.2f}\n" if amount_required is not None else ""
+
         message = (
             f"{emoji} <b>NEW TRADE — NIFTY</b>\n\n"
             f"<b>Direction:</b> {direction}  |  <b>Instrument:</b> {inst_label}\n\n"
             f"<b>Entry:</b> ₹{entry_price:.2f}\n"
+            f"{amt_line}"
             f"<b>SL:</b>    ₹{sl:.2f}  (–{sl_pct:.1f}%)\n"
             f"<b>Qty:</b>   {quantity}\n\n"
             f"<b>Time:</b>  {now_ist().strftime('%H:%M')} IST"
@@ -149,26 +152,36 @@ class TelegramNotifier:
         cap_section = ""
         if capital_summary:
             cap_used = capital_summary.get("capital_used", 180000.0)
-            is_profit = capital_summary.get("is_profit", False)
+            base_cap = capital_summary.get("base_capital", 180000.0)
             day_pnl = capital_summary.get("day_pnl", 0.0)
             day_pnl_sign = "+" if day_pnl >= 0 else ""
-            next_day_cap = capital_summary.get("next_day_capital", 180000.0)
+            cap_rem = capital_summary.get("capital_remaining", cap_used + day_pnl)
+            next_day_cap = capital_summary.get("next_day_capital", cap_rem)
             overall = capital_summary.get("overall_pnl", 0.0)
             overall_sign = "+" if overall >= 0 else ""
+            is_base_restored = capital_summary.get("is_base_restored", next_day_cap >= base_cap)
+            profit_reaped = capital_summary.get("profit_reaped", 0.0)
 
-            if is_profit:
+            if is_base_restored and profit_reaped > 0:
                 cap_details = (
                     f"<b>Capital Used Today:</b> ₹{cap_used:,.2f}\n"
-                    f"<b>Profit Credited:</b> ₹{day_pnl_sign}{day_pnl:,.2f} (Added to passive income)\n"
-                    f"<b>Tomorrow Starts:</b> ₹{next_day_cap:,.2f} (Reset to ceiling — profits reaped)\n"
+                    f"<b>Profit Credited:</b> +₹{profit_reaped:,.2f} (Added to passive income)\n"
+                    f"<b>Tomorrow Starts:</b> ₹{next_day_cap:,.2f} (Base restored — profits reaped)\n"
                     f"<b>Overall P&L:</b> ₹{overall_sign}{overall:,.2f} (since inception)"
                 )
-            else:
-                cap_rem = capital_summary.get("capital_remaining", next_day_cap)
+            elif is_base_restored:
                 cap_details = (
                     f"<b>Capital Used Today:</b> ₹{cap_used:,.2f}\n"
                     f"<b>Capital Remaining:</b> ₹{cap_rem:,.2f}\n"
-                    f"<b>Tomorrow Starts:</b> ₹{next_day_cap:,.2f} (Loss carried forward)\n"
+                    f"<b>Tomorrow Starts:</b> ₹{next_day_cap:,.2f} (Base capital intact)\n"
+                    f"<b>Overall P&L:</b> ₹{overall_sign}{overall:,.2f} (since inception)"
+                )
+            else:
+                deficit = base_cap - cap_rem
+                cap_details = (
+                    f"<b>Capital Used Today:</b> ₹{cap_used:,.2f}\n"
+                    f"<b>Capital Remaining:</b> ₹{cap_rem:,.2f}\n"
+                    f"<b>Tomorrow Starts:</b> ₹{next_day_cap:,.2f} (Recovering — ₹{deficit:,.2f} below base)\n"
                     f"<b>Overall P&L:</b> ₹{overall_sign}{overall:,.2f} (since inception)"
                 )
             cap_section = f"\n━━━━━━━━━━━━━━━━━━━━━━\n{cap_details}\n━━━━━━━━━━━━━━━━━━━━━━\n"
