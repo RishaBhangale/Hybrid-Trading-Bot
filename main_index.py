@@ -643,10 +643,14 @@ class IndexOptionsBot:
         self.spot_token = 256265
         self.token_to_symbol: Dict[int, str] = {self.spot_token: "NIFTY"}
         self._needs_restart = False
+        self._needs_reauth = False
+        self._ws_last_error = ""
+        self._ws_connected = False
+        self._watchdog_retries = 0
+        self.log_file = LOG_DIR / f"index_{now_ist().strftime('%Y%m%d')}.log"
         self.capital_tracker = CapitalTracker(base_capital=STRATEGY_CEILING, options_min_capital=25000.0, futures_min_capital=120000.0, logger=self._log)
         self.execution_engine = ExecutionEngine(paper_trading=PAPER_TRADING, logger=self._log)
         self.trader = IndexTrader(self._log, None, None, self.telegram, self.capital_tracker, self, self.execution_engine)
-        self.log_file = LOG_DIR / f"index_{now_ist().strftime('%Y%m%d')}.log"
 
     def _log(self, msg: str):
         ts = now_ist().strftime("%Y-%m-%d %H:%M:%S")
@@ -724,12 +728,15 @@ class IndexOptionsBot:
         self.ticker = KiteTicker(creds["api_key"], self.kite.access_token)
         self._last_tick_time = None  # Set only when first real tick arrives
         self._feed_start_time = now_ist()  # Initialized at launch so watchdog can detect starvation
+        self._ws_connected = False
         
         def on_connect(ws, resp):
             tokens = list(self.token_to_symbol.keys())
             ws.subscribe(tokens)
             ws.set_mode(ws.MODE_FULL, tokens)
             self._feed_start_time = now_ist()  # Mark when feed actually connected
+            self._ws_connected = True
+            self._ws_last_error = ""
             self._log(f"✅ WebSocket connected — subscribed to {len(tokens)} tokens.")
             
         def on_ticks(ws, ticks):
@@ -748,9 +755,16 @@ class IndexOptionsBot:
                         self.trader.process_tick(ltp, now_ist(), vol)
 
         def on_error(ws, code, reason):
-            self._log(f"⚠️ WebSocket error [{code}]: {reason} — will attempt reconnect.")
+            err_msg = f"[{code}] {reason}"
+            self._ws_last_error = err_msg
+            self._log(f"⚠️ WebSocket error {err_msg} — will attempt reconnect.")
+            if code == 1006 or "403" in str(reason) or "Forbidden" in str(reason):
+                self._needs_reauth = True
+                self._needs_restart = True
 
         def on_close(ws, code, reason):
+            self._ws_connected = False
+            self._ws_last_error = f"[{code}] {reason}"
             self._log(f"⚠️ WebSocket closed [{code}]: {reason}.")
             if self.is_running and self.is_market_open():
                 self._log("🔄 Market is open — waiting for KiteTicker auto-reconnect...")
@@ -771,16 +785,39 @@ class IndexOptionsBot:
         self.ticker.connect(threaded=True)
 
     def _restart_ticker(self):
-        """Hard-restart the KiteTicker when auto-reconnect is exhausted. Main thread only."""
+        """Hard-restart the KiteTicker with session validation. Main thread only."""
         self._needs_restart = False
+        reauth_needed = getattr(self, "_needs_reauth", False)
+        self._needs_reauth = False
+
         try:
             if self.ticker:
                 self.ticker.close()
         except Exception:
             pass
-        time.sleep(5)
+
+        # Check if session is valid; if dead, re-authenticate to get fresh token
+        is_session_valid = False
+        if not reauth_needed and self.kite and getattr(self.kite, "access_token", None):
+            try:
+                self.kite.profile()
+                is_session_valid = True
+            except Exception as e:
+                self._log(f"⚠️ Access token check failed ({e}) — session expired or invalidated.")
+                is_session_valid = False
+
+        if not is_session_valid or reauth_needed:
+            self._log("🔄 Re-authenticating with Kite to obtain fresh access token...")
+            if self.authenticate():
+                self._log("✅ Re-authentication successful! Reconnecting with fresh token.")
+            else:
+                self._log("❌ Re-authentication failed!")
+                return False
+
+        time.sleep(3)
         self.start_live_feed()
         self._log("✅ WebSocket ticker restarted successfully.")
+        return True
 
     def is_market_open(self) -> bool:
         now = now_ist()

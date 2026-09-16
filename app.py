@@ -161,37 +161,71 @@ def run_single_trading_day() -> bool:
                     )
                 heartbeat_sent = True
 
-            # 2. Tick-Starvation Watchdog (two cases handled):
-            #    A) Had ticks before, now silent for >5 mins → restart
-            #    B) Never got any tick, and feed has been up for >10 mins → restart
-            #    C) on_noreconnect set _needs_restart flag → restart from main thread
+            # 2. Tick-Starvation Watchdog (with Circuit Breaker & Re-Auth)
             if bot_instance.is_market_open():
                 last_tick = getattr(bot_instance, "_last_tick_time", None)
                 feed_start = getattr(bot_instance, "_feed_start_time", None)
+                ws_error = getattr(bot_instance, "_ws_last_error", "")
+                ws_connected = getattr(bot_instance, "_ws_connected", False)
 
                 needs_restart = getattr(bot_instance, "_needs_restart", False)
                 restart_reason = ""
 
+                # Recovery check: If ticks resumed after previous watchdog failure
+                if last_tick is not None and getattr(bot_instance, "_watchdog_retries", 0) > 0:
+                    old_retries = bot_instance._watchdog_retries
+                    bot_instance._watchdog_retries = 0
+                    if old_retries >= 2:
+                        try:
+                            if hasattr(bot_instance, "telegram") and bot_instance.telegram:
+                                bot_instance.telegram.send_message(
+                                    f"✅ <b>WebSocket Feed Restored</b>\n\n"
+                                    f"Ticks flowing normally after {old_retries} restart attempt(s)."
+                                )
+                        except Exception:
+                            pass
+
                 if needs_restart:
-                    restart_reason = "WebSocket exhausted reconnect attempts (flag set by on_noreconnect)"
+                    restart_reason = f"WebSocket error: {ws_error or 'reconnect attempts exhausted'}"
                 elif last_tick is not None and (now - last_tick).total_seconds() > 300:
                     needs_restart = True
                     restart_reason = "no ticks for 5+ minutes (feed dropped)"
-                elif last_tick is None and feed_start is not None and (now - feed_start).total_seconds() > 300:
-                    needs_restart = True
-                    restart_reason = "no ticks received in first 5 mins (feed never connected)"
+                elif last_tick is None and feed_start is not None:
+                    retries = getattr(bot_instance, "_watchdog_retries", 0)
+                    check_interval = 900 if retries >= 3 else 300
+                    if (now - feed_start).total_seconds() > check_interval:
+                        needs_restart = True
+                        err_detail = f" [Error: {ws_error}]" if ws_error else ""
+                        status_str = "connected but 0 ticks" if ws_connected else "failed to connect"
+                        restart_reason = f"no ticks received in {int(check_interval/60)} mins ({status_str}){err_detail}"
 
                 if needs_restart:
-                    add_log(f"Watchdog triggered: {restart_reason} — restarting WebSocket...")
-                    try:
-                        if hasattr(bot_instance, "telegram") and bot_instance.telegram:
-                            bot_instance.telegram.send_message(
-                                f"⚠️ <b>WebSocket Watchdog Triggered</b>\n\n"
-                                f"<b>Reason:</b> {restart_reason}\n"
-                                f"Restarting WebSocket feed..."
-                            )
-                    except Exception as tg_err:
-                        add_log(f"Telegram watchdog alert failed: {tg_err}")
+                    watchdog_retries = getattr(bot_instance, "_watchdog_retries", 0) + 1
+                    bot_instance._watchdog_retries = watchdog_retries
+
+                    add_log(f"Watchdog triggered (#{watchdog_retries}): {restart_reason} — restarting WebSocket...")
+                    if watchdog_retries <= 3:
+                        try:
+                            if hasattr(bot_instance, "telegram") and bot_instance.telegram:
+                                bot_instance.telegram.send_message(
+                                    f"⚠️ <b>WebSocket Watchdog Triggered (#{watchdog_retries}/3)</b>\n\n"
+                                    f"<b>Reason:</b> {restart_reason}\n"
+                                    f"Validating session and restarting live feed..."
+                                )
+                        except Exception as tg_err:
+                            add_log(f"Telegram watchdog alert failed: {tg_err}")
+                    elif watchdog_retries == 4:
+                        try:
+                            if hasattr(bot_instance, "telegram") and bot_instance.telegram:
+                                bot_instance.telegram.send_message(
+                                    f"🚨 <b>WebSocket Watchdog Circuit Breaker Tripped</b>\n\n"
+                                    f"WebSocket feed failed to receive ticks after 3 restart attempts.\n"
+                                    f"<b>Last Reason:</b> {restart_reason}\n\n"
+                                    f"<i>Watchdog alerts paused to prevent spam. Retrying quietly every 15 minutes.</i>"
+                                )
+                        except Exception as tg_err:
+                            add_log(f"Telegram circuit breaker alert failed: {tg_err}")
+
                     try:
                         bot_instance._restart_ticker()
                         add_log("WebSocket feed restarted by watchdog.")
