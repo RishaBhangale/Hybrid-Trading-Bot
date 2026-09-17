@@ -785,18 +785,37 @@ class IndexOptionsBot:
         self.ticker.connect(threaded=True)
 
     def _restart_ticker(self):
-        """Hard-restart the KiteTicker with session validation. Main thread only."""
+        """Hard-restart the KiteTicker, correctly handling the Twisted reactor singleton.
+
+        Problem: KiteTicker.connect(threaded=True) starts reactor.run() in a daemon thread.
+        After ticker.close(), the reactor keeps running (reactor.running == True).
+        Calling connect() again skips the `if not reactor.running:` block, so the reactor
+        thread is never recreated — but connectWS() IS still called which schedules a TCP
+        connection inside the already-running reactor. However, factory state from the old
+        connection can be stale, so the on_connect callback never fires reliably.
+
+        Fix: After close(), we manually call _create_connection() to build a fresh factory
+        with clean state, then use reactor.callFromThread(connectWS, ...) to schedule the
+        new WebSocket handshake inside the already-running reactor event loop. This bypasses
+        the broken `if not reactor.running:` guard and guarantees the connection is made.
+        """
+        from twisted.internet import reactor, ssl
+        from autobahn.twisted.websocket import connectWS
+
         self._needs_restart = False
         reauth_needed = getattr(self, "_needs_reauth", False)
         self._needs_reauth = False
 
+        # 1. Close old ticker cleanly (stops retry loop, closes WS — does NOT stop reactor)
         try:
             if self.ticker:
-                self.ticker.close()
+                self.ticker.stop_retry()
+                self.ticker._close()
         except Exception:
             pass
+        time.sleep(2)  # Let the old connection fully close before rebuilding factory
 
-        # Check if session is valid; if dead, re-authenticate to get fresh token
+        # 2. Validate session; re-authenticate if the access token is dead
         is_session_valid = False
         if not reauth_needed and self.kite and getattr(self.kite, "access_token", None):
             try:
@@ -814,9 +833,89 @@ class IndexOptionsBot:
                 self._log("❌ Re-authentication failed!")
                 return False
 
-        time.sleep(3)
-        self.start_live_feed()
-        self._log("✅ WebSocket ticker restarted successfully.")
+        # 3. Build a brand-new KiteTicker with fresh factory state and attach all callbacks
+        creds = load_credentials()
+        new_ticker = KiteTicker(creds["api_key"], self.kite.access_token)
+        tokens = list(self.token_to_symbol.keys())
+
+        # Reset tracking state before the new connection attempt
+        self._last_tick_time = None
+        self._feed_start_time = now_ist()
+        self._ws_connected = False
+
+        def on_connect(ws, resp):
+            ws.subscribe(tokens)
+            ws.set_mode(ws.MODE_FULL, tokens)
+            self._feed_start_time = now_ist()
+            self._ws_connected = True
+            self._ws_last_error = ""
+            self._log(f"✅ WebSocket reconnected — subscribed to {len(tokens)} tokens.")
+
+        def on_ticks(ws, ticks):
+            self._last_tick_time = now_ist()
+            for t in ticks:
+                tok = t.get("instrument_token")
+                if tok in self.token_to_symbol:
+                    sym = self.token_to_symbol[tok]
+                    ltp = t.get("last_price")
+                    vol = t.get("volume_traded", 0)
+                    if sym.startswith("OPT_"):
+                        opt_tsym = sym[4:]
+                        if ltp:
+                            self.trader.last_option_ltp[opt_tsym] = ltp
+                    elif sym == "NIFTY" and ltp:
+                        self.trader.process_tick(ltp, now_ist(), vol)
+
+        def on_error(ws, code, reason):
+            err_msg = f"[{code}] {reason}"
+            self._ws_last_error = err_msg
+            self._log(f"⚠️ WebSocket error {err_msg} — will attempt reconnect.")
+            if code == 1006 or "403" in str(reason) or "Forbidden" in str(reason):
+                self._needs_reauth = True
+                self._needs_restart = True
+
+        def on_close(ws, code, reason):
+            self._ws_connected = False
+            self._ws_last_error = f"[{code}] {reason}"
+            self._log(f"⚠️ WebSocket closed [{code}]: {reason}.")
+            if self.is_running and self.is_market_open():
+                self._log("🔄 Market is open — waiting for KiteTicker auto-reconnect...")
+
+        def on_reconnect(ws, attempt):
+            self._log(f"🔄 WebSocket reconnecting... attempt #{attempt}")
+
+        def on_noreconnect(ws):
+            self._log("❌ WebSocket exhausted all reconnect attempts — setting restart flag.")
+            self._needs_restart = True
+
+        new_ticker.on_connect = on_connect
+        new_ticker.on_ticks = on_ticks
+        new_ticker.on_error = on_error
+        new_ticker.on_close = on_close
+        new_ticker.on_reconnect = on_reconnect
+        new_ticker.on_noreconnect = on_noreconnect
+
+        # 4. Build fresh factory (clean state, no stale connection artifacts)
+        new_ticker._create_connection(
+            new_ticker.socket_url,
+            useragent=new_ticker._user_agent(),
+            headers={"X-Kite-Version": "3"},
+        )
+        self.ticker = new_ticker
+
+        # 5. Schedule the WebSocket handshake into the ALREADY-RUNNING reactor.
+        #    connectWS() alone just queues the TCP connect — the reactor picks it up
+        #    on its next iteration. Since reactor.running == True, this is the only
+        #    correct way to reconnect without spawning a second reactor thread.
+        context_factory = ssl.ClientContextFactory() if new_ticker.factory.isSecure else None
+        reactor.callFromThread(
+            connectWS,
+            new_ticker.factory,
+            contextFactory=context_factory,
+            timeout=new_ticker.connect_timeout,
+        )
+
+        self._log("✅ WebSocket reconnection scheduled in Twisted reactor (reactor.callFromThread).")
         return True
 
     def is_market_open(self) -> bool:

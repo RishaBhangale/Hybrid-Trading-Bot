@@ -141,6 +141,15 @@ def run_single_trading_day() -> bool:
 
         bot_instance.start_live_feed()
 
+        # Give the WebSocket 90 seconds to complete its initial handshake before the
+        # watchdog starts evaluating ticks. Zerodha's WS can take 30-60 seconds to
+        # stabilize at market open, especially on Render cold starts.
+        add_log("Waiting 90s for WebSocket initial handshake to stabilize...")
+        time.sleep(90)
+        # Reset feed_start_time to NOW so the watchdog 5-min window starts from here.
+        if bot_instance and hasattr(bot_instance, "_feed_start_time"):
+            bot_instance._feed_start_time = now_ist()
+
         heartbeat_sent = False
         # Run until 15:35 IST regardless of WebSocket timing (prevents early exit at 09:15)
         session_end = now_ist().replace(hour=15, minute=35, second=0, microsecond=0)
