@@ -175,7 +175,14 @@ class ExecutionEngine:
                 self.logger(f"⚠️ [LIVE] Order verification error: {e}")
                 time.sleep(delay)
         
-        self.logger(f"⚠️ [LIVE] Order verification timeout after {max_retries} attempts")
+        # Order verification timed out — the order may still be live on the exchange.
+        # Cancel it immediately to prevent a "ghost" fill hours later at an untracked price.
+        self.logger(f"⚠️ [LIVE] Order verification timeout after {max_retries} attempts — attempting cancel...")
+        try:
+            self.kite.cancel_order(variety=self.kite.VARIETY_REGULAR, order_id=order_id)
+            self.logger(f"🗑️ [LIVE] Timed-out order {order_id} cancelled successfully.")
+        except Exception as ce:
+            self.logger(f"⚠️ [LIVE] Could not cancel timed-out order {order_id}: {ce} — manual check required!")
         return {
             "order_id": order_id,
             "status": "TIMEOUT",

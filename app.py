@@ -26,6 +26,7 @@ sys.path.insert(0, str(BASE_DIR))
 
 from main_index import IndexOptionsBot, STRATEGY_MODE, PAPER_TRADING, now_ist, TOTAL_EQUITY, STRATEGY_CEILING, PROTECTED_RESERVE
 from auto_login import KiteAutoLogin, load_credentials
+import signal
 
 # Global state
 bot_instance = None
@@ -63,6 +64,59 @@ def add_log(message: str):
     bot_logs.append(log_entry)
     if len(bot_logs) > 250:
         bot_logs.pop(0)
+
+
+def _handle_sigterm(signum, frame):
+    """Graceful shutdown on Render redeploy (SIGTERM).
+    Alerts Telegram so the user knows to check Zerodha for open positions."""
+    add_log("⚠️ SIGTERM received — bot is shutting down. Check Zerodha for open positions!")
+    if bot_instance:
+        if bot_instance.telegram:
+            try:
+                bot_instance.telegram.send_message(
+                    "⚠️ <b>Index Bot received SIGTERM — shutting down</b>\n\n"
+                    "Render is restarting the service. If any positions are open, "
+                    "Zerodha's MIS auto-square-off is the safety net.\n\n"
+                    "<i>Please verify in Zerodha that no positions are orphaned.</i>"
+                )
+            except Exception:
+                pass
+        try:
+            bot_instance.is_running = False
+            bot_instance.stop()
+        except Exception:
+            pass
+
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
+
+
+def _check_broker_orphans(bot: "IndexOptionsBot"):
+    """On startup, call kite.positions() and alert if broker shows open NFO
+    positions while the bot's own positions list is empty. This catches the
+    restart-amnesia case where a position was left open before the restart."""
+    if not bot or not bot.kite:
+        return
+    try:
+        broker_positions = bot.kite.positions()
+        open_nfo = [
+            p for p in broker_positions.get("net", [])
+            if p.get("exchange") == "NFO" and abs(p.get("quantity", 0)) > 0
+        ]
+        if open_nfo and not bot.trader.positions:
+            symbols = ", ".join(p["tradingsymbol"] for p in open_nfo)
+            msg = (
+                f"⚠️ <b>Orphaned Broker Positions Detected on Startup</b>\n\n"
+                f"Broker shows open NFO position(s) but bot has no record of them:\n"
+                f"<code>{symbols}</code>\n\n"
+                f"These may be from a previous session. Please review and close manually if needed.\n"
+                f"Bot will trade normally — it will NOT attempt to manage unknown positions."
+            )
+            add_log(f"⚠️ ORPHAN CHECK: Broker has open NFO positions not tracked by bot: {symbols}")
+            if bot.telegram:
+                bot.telegram.send_message(msg)
+    except Exception as e:
+        add_log(f"⚠️ Could not check broker positions on startup: {e}")
 
 
 def run_single_trading_day() -> bool:
@@ -116,6 +170,9 @@ def run_single_trading_day() -> bool:
     bot_status["authenticated"] = True
     bot_status["status"] = "waiting_for_market"
     bot_instance.is_running = True
+
+    # Check for orphaned broker positions from previous session
+    _check_broker_orphans(bot_instance)
 
     # Wait for market open
     now = now_ist()

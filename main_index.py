@@ -28,11 +28,8 @@ import numpy as np
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
 
-try:
-    import pytz
-    IST = pytz.timezone("Asia/Kolkata")
-except ImportError:
-    IST = None
+import pytz
+IST = pytz.timezone("Asia/Kolkata")  # Hard-fail: if pytz missing, all time logic is wrong
 
 try:
     from kiteconnect import KiteConnect, KiteTicker
@@ -150,6 +147,7 @@ class CapitalTracker:
         self.load_state()
 
     def load_state(self):
+        today_str = now_ist().strftime("%Y-%m-%d")
         # 1. Prefer capital_state.json (local file updated by latest run/end_day)
         loaded = False
         if self.state_file.exists():
@@ -157,6 +155,14 @@ class CapitalTracker:
                 data = json.loads(self.state_file.read_text())
                 self.session_capital = float(data.get("session_capital", self.base_capital))
                 self.overall_pnl = float(data.get("overall_pnl", 0.0))
+                # Restore today's running P&L total so the daily loss limit survives
+                # mid-day restarts. Only apply if the state was written today — yesterday's
+                # daily P&L is irrelevant (it was already absorbed into session_capital).
+                last_updated = data.get("last_updated", "")
+                if last_updated.startswith(today_str):
+                    self.daily_realized_pnl = float(data.get("daily_realized_pnl", 0.0))
+                    if self.daily_realized_pnl != 0.0:
+                        self.logger(f"💼 Restored today's running P&L: ₹{self.daily_realized_pnl:+,.2f} (daily loss limit intact)")
                 self.logger(f"💼 Capital state loaded from file: Session Capital=₹{self.session_capital:,.2f}, Overall P&L=₹{self.overall_pnl:,.2f}")
                 loaded = True
             except Exception as e:
@@ -185,7 +191,27 @@ class CapitalTracker:
             os.environ["SESSION_CAPITAL"] = str(self.session_capital)
             os.environ["OVERALL_PNL"] = str(self.overall_pnl)
 
+    def _save_local_state(self):
+        """Write state to local JSON only — does NOT push to Render env vars.
+        Safe to call after every trade because it never triggers a Render redeploy.
+        Includes daily_realized_pnl so the loss limit survives intraday restarts."""
+        os.environ["SESSION_CAPITAL"] = str(self.session_capital)
+        os.environ["OVERALL_PNL"] = str(self.overall_pnl)
+        try:
+            data = {
+                "base_capital": self.base_capital,
+                "session_capital": self.session_capital,
+                "overall_pnl": self.overall_pnl,
+                "daily_realized_pnl": self.daily_realized_pnl,
+                "last_updated": now_ist().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            self.state_file.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            self.logger(f"⚠️ Error saving capital_state.json (local): {e}")
+
     def save_state(self):
+        """Full state save: local file + Render env vars. Call only at EOD.
+        Note: pushing to Render env vars triggers a service redeploy."""
         # Always sync to in-memory os.environ first
         os.environ["SESSION_CAPITAL"] = str(self.session_capital)
         os.environ["OVERALL_PNL"] = str(self.overall_pnl)
@@ -196,6 +222,7 @@ class CapitalTracker:
                 "base_capital": self.base_capital,
                 "session_capital": self.session_capital,
                 "overall_pnl": self.overall_pnl,
+                "daily_realized_pnl": self.daily_realized_pnl,
                 "last_updated": now_ist().strftime("%Y-%m-%d %H:%M:%S")
             }
             self.state_file.write_text(json.dumps(data, indent=2))
@@ -266,9 +293,11 @@ class CapitalTracker:
             return True, "OK"
 
     def record_trade_pnl(self, pnl: float):
-        """Record a closed trade's P&L for daily loss limit tracking."""
+        """Record a closed trade's P&L for daily loss limit tracking.
+        Persists to local file immediately so the limit survives mid-day restarts."""
         with self.lock:
             self.daily_realized_pnl += pnl
+            self._save_local_state()  # Local-only save — no Render push, no redeploy
 
     def end_day(self, day_net_pnl: float) -> dict:
         capital_used = self.session_capital
@@ -302,7 +331,8 @@ class CapitalTracker:
         }
         
         self.session_capital = next_day_capital
-        self.save_state()
+        self.daily_realized_pnl = 0.0  # Reset for next day before saving
+        self.save_state()  # Full save (local + Render) only at EOD
         return summary
 
 
@@ -544,19 +574,37 @@ class IndexTrader:
         
         sl = max(0.50, live_price * 0.75)  # 25% option stop-loss
         pos = IndexPosition("1B_ORB_OPTIONS", opt_type, "OPTIONS", tsym, live_price, sl, lot, now_ist(), spot)
-        self.positions.append(pos)
-        
-        # Subscribe option token to WebSocket for real-time SL
-        self.last_option_ltp[tsym] = live_price
+
+        # Subscribe option token to WebSocket BEFORE creating the position.
+        # If subscription fails, we abort the entry entirely — holding a position
+        # without a live SL feed is more dangerous than missing the trade.
         if self.bot_controller and self.bot_controller.ticker:
             try:
                 self.bot_controller.ticker.subscribe([token])
                 self.bot_controller.ticker.set_mode(self.bot_controller.ticker.MODE_FULL, [token])
                 self.bot_controller.token_to_symbol[token] = f"OPT_{tsym}"
+                self.last_option_ltp[tsym] = live_price  # Seed with entry price until first tick
                 self.logger(f"📡 Subscribed NIFTY option token {token} ({tsym}) to WebSocket")
             except Exception as e:
-                self.logger(f"⚠️ Failed to subscribe option token: {e}")
+                self.logger(f"❌ [NIFTY ATM {opt_type}] ABORTING ENTRY — failed to subscribe option token {token} ({tsym}): {e}")
+                if self.telegram:
+                    try:
+                        self.telegram.send_message(
+                            f"❌ <b>NIFTY {opt_type} Entry Aborted</b>\n\n"
+                            f"Could not subscribe option token to WebSocket feed.\n"
+                            f"<b>Symbol:</b> {tsym}\n"
+                            f"<b>Error:</b> {e}\n\n"
+                            f"<i>Entry skipped to avoid holding an unmonitored position.</i>"
+                        )
+                    except Exception:
+                        pass
+                return  # Abort — no position created, no P&L risk
+        else:
+            # No ticker available — seed LTP dict but warn that SL monitoring may not work
+            self.last_option_ltp[tsym] = live_price
+            self.logger(f"⚠️ [NIFTY ATM {opt_type}] No ticker available to subscribe {tsym} — SL monitoring via REST fallback only")
 
+        self.positions.append(pos)
         self._notify_entry(pos, f"NIFTY ATM {opt_type} ({tsym} @ ₹{live_price:.2f})")
 
     def _notify_entry(self, pos: IndexPosition, desc: str):
@@ -573,34 +621,73 @@ class IndexTrader:
 
     def _close_position(self, pos: IndexPosition, exit_price: float, reason: str):
         if pos not in self.positions: return
-        self.positions.remove(pos)
-        
-        # Execute exit via ExecutionEngine
+
+        # Determine transaction type for exit
+        txn = "SELL" if pos.instrument == "OPTIONS" or pos.position_type == "LONG" else "BUY"
+        confirmed_fill = False
+        fill_price = exit_price  # Default to decision price (paper or fallback)
+
         if self.execution_engine:
-            txn = "SELL" if pos.instrument == "OPTIONS" or pos.position_type == "LONG" else "BUY"
             res = self.execution_engine.place_exit_order(pos.tradingsymbol, pos.quantity, txn, exit_price)
+
             if res["status"] == "COMPLETE" and res["fill_price"] > 0:
-                exit_price = res["fill_price"]
-        
-        pos.close(exit_price, reason)
+                fill_price = res["fill_price"]
+                confirmed_fill = True
+            elif not res.get("paper"):
+                # Live exit failed — retry once with MARKET order to guarantee fill
+                self.logger(f"⚠️ [EXIT FAILED] {pos.tradingsymbol} {reason}: {res.get('status')} — retrying with MARKET order...")
+                retry_res = self.execution_engine.place_exit_order(pos.tradingsymbol, pos.quantity, txn, 0.0)
+                if retry_res["status"] == "COMPLETE" and retry_res["fill_price"] > 0:
+                    fill_price = retry_res["fill_price"]
+                    confirmed_fill = True
+                    self.logger(f"✅ [EXIT RETRY OK] {pos.tradingsymbol} filled @ ₹{fill_price:.2f}")
+                else:
+                    # Both attempts failed — keep position alive and alert loudly
+                    pos.orphaned = True
+                    alert_msg = (
+                        f"🚨 <b>EXIT ORDER FAILED — MANUAL INTERVENTION REQUIRED</b>\n\n"
+                        f"<b>Symbol:</b> {pos.tradingsymbol}\n"
+                        f"<b>Reason triggered:</b> {reason}\n"
+                        f"<b>Order status:</b> {retry_res.get('status', 'UNKNOWN')}\n"
+                        f"<b>Error:</b> {retry_res.get('error', 'No error detail')}\n\n"
+                        f"Position is <b>still open at broker</b>. Bot has NOT booked P&amp;L.\n"
+                        f"Please close manually in Zerodha immediately."
+                    )
+                    self.logger(f"🚨 EXIT FAILED FOR {pos.tradingsymbol} — ORPHANED POSITION. Manual action required!")
+                    if self.telegram:
+                        try:
+                            self.telegram.send_message(alert_msg)
+                        except Exception:
+                            pass
+                    return  # Do NOT remove from positions, do NOT book P&L
+            else:
+                # Paper trading — always treat as confirmed at decision price
+                confirmed_fill = True
+
+        else:
+            # No execution engine — paper/manual mode, treat as confirmed
+            confirmed_fill = True
+
+        # Only reach here on a confirmed fill (or paper mode)
+        self.positions.remove(pos)
+        pos.close(fill_price, reason)
         self.closed_trades.append(pos)
-        
-        # Record trade P&L to capital tracker
+
+        # Record trade P&L to capital tracker (also persists daily_realized_pnl)
         if self.capital_tracker:
             self.capital_tracker.record_trade_pnl(pos.net_pnl)
-        
+
         emoji = "✅" if pos.net_pnl > 0 else "🛑"
         print(f"\n{emoji} [NIFTY EXIT] {pos.tradingsymbol} - {reason}", flush=True)
-        print(f"   Entry: ₹{pos.entry_price:.2f} → Exit: ₹{exit_price:.2f} | Net P&L: ₹{pos.net_pnl:+,.2f}", flush=True)
+        print(f"   Entry: ₹{pos.entry_price:.2f} → Exit: ₹{fill_price:.2f} | Net P&L: ₹{pos.net_pnl:+,.2f}", flush=True)
         print(f"{'='*60}\n", flush=True)
-        
+
         if self.telegram:
-            self.telegram.notify_trade_exit("NIFTY", pos.position_type, pos.spot_at_entry, pos.entry_price, exit_price, pos.net_pnl, reason)
+            self.telegram.notify_trade_exit("NIFTY", pos.position_type, pos.spot_at_entry, pos.entry_price, fill_price, pos.net_pnl, reason)
 
         # Unsubscribe option token from WebSocket
         if pos.instrument == "OPTIONS" and self.bot_controller and self.bot_controller.ticker:
             try:
-                # Find token for this tradingsymbol
                 for tok, sym in list(self.bot_controller.token_to_symbol.items()):
                     if sym == f"OPT_{pos.tradingsymbol}":
                         self.bot_controller.ticker.unsubscribe([tok])
@@ -758,7 +845,11 @@ class IndexOptionsBot:
             err_msg = f"[{code}] {reason}"
             self._ws_last_error = err_msg
             self._log(f"⚠️ WebSocket error {err_msg} — will attempt reconnect.")
-            if code == 1006 or "403" in str(reason) or "Forbidden" in str(reason):
+            # Only treat as auth failure on explicit 403/Forbidden.
+            # Plain 1006 = transient network closure — let KiteTicker's built-in
+            # backoff retry handle it. Escalating to reauth on 1006 kills the
+            # built-in retry and triggers a Selenium re-login race.
+            if "403" in str(reason) or "Forbidden" in str(reason):
                 self._needs_reauth = True
                 self._needs_restart = True
 
@@ -836,7 +927,6 @@ class IndexOptionsBot:
         # 3. Build a brand-new KiteTicker with fresh factory state and attach all callbacks
         creds = load_credentials()
         new_ticker = KiteTicker(creds["api_key"], self.kite.access_token)
-        tokens = list(self.token_to_symbol.keys())
 
         # Reset tracking state before the new connection attempt
         self._last_tick_time = None
@@ -844,6 +934,11 @@ class IndexOptionsBot:
         self._ws_connected = False
 
         def on_connect(ws, resp):
+            # Read token_to_symbol INSIDE the callback so it's always current.
+            # If captured outside, any option token subscribed after this restart
+            # won't be in the list — future auto-reconnects would miss re-subscribing it,
+            # silently killing that option's SL feed.
+            tokens = list(self.token_to_symbol.keys())
             ws.subscribe(tokens)
             ws.set_mode(ws.MODE_FULL, tokens)
             self._feed_start_time = now_ist()
@@ -870,7 +965,8 @@ class IndexOptionsBot:
             err_msg = f"[{code}] {reason}"
             self._ws_last_error = err_msg
             self._log(f"⚠️ WebSocket error {err_msg} — will attempt reconnect.")
-            if code == 1006 or "403" in str(reason) or "Forbidden" in str(reason):
+            # Only treat as auth failure on explicit 403/Forbidden (not plain 1006)
+            if "403" in str(reason) or "Forbidden" in str(reason):
                 self._needs_reauth = True
                 self._needs_restart = True
 
