@@ -141,6 +141,31 @@ def run_single_trading_day() -> bool:
         add_log("📅 Weekend - Market closed")
         return True
 
+    # T3-F: NSE holiday calendar check — skip gazetted NSE holidays without logging in.
+    # Update this list each year. Source: NSE circular on exchange holidays.
+    NSE_HOLIDAYS_2026 = {
+        "2026-01-26",  # Republic Day
+        "2026-03-02",  # Maha Shivaratri
+        "2026-03-25",  # Holi
+        "2026-04-02",  # Ram Navami
+        "2026-04-03",  # Good Friday
+        "2026-04-14",  # Dr. Ambedkar Jayanti
+        "2026-05-01",  # Maharashtra Day
+        "2026-08-15",  # Independence Day
+        "2026-08-27",  # Ganesh Chaturthi
+        "2026-10-02",  # Gandhi Jayanti / Dussehra
+        "2026-10-20",  # Diwali Laxmi Puja
+        "2026-10-21",  # Diwali Balipratipada
+        "2026-11-04",  # Guru Nanak Jayanti
+        "2026-12-25",  # Christmas
+    }
+    today_str = now.strftime("%Y-%m-%d")
+    if today_str in NSE_HOLIDAYS_2026:
+        bot_status["status"] = "sleeping"
+        bot_status["market_status"] = "NSE Holiday"
+        add_log(f"📅 NSE Holiday ({today_str}) — Market closed. Skipping trading session.")
+        return True
+
     # After hours check — clear any stale error status
     if now > market_close:
         bot_status["status"] = "sleeping"
@@ -298,14 +323,66 @@ def run_single_trading_day() -> bool:
                     except Exception as wd_err:
                         add_log(f"Watchdog restart failed: {wd_err}")
 
-            # 3. Time-based forced square-off at 15:20 IST (safety net)
-            if now.hour == 15 and now.minute >= 20 and now.minute < 25:
+            # 2b. Option feed staleness watchdog — REST LTP fallback (T2-E)
+            # If an option position exists but last_option_tick_time is >90s old
+            # (or was never set), fall back to REST LTP to keep the SL feed alive.
+            OPTION_STALE_SECS = 90
+            if bot_instance.is_market_open() and bot_instance.kite:
                 for pos in list(bot_instance.trader.positions):
-                    add_log(f"⏰ Force-closing open NIFTY position {pos.tradingsymbol} at 15:20 (time-based safety)")
-                    try:
-                        bot_instance.trader._close_position(pos, pos.entry_price, "EOD_FORCE_CLOSE")
-                    except Exception as sq_err:
-                        add_log(f"Force square-off error: {sq_err}")
+                    if pos.instrument != "OPTIONS" or getattr(pos, "orphaned", False):
+                        continue
+                    tsym = pos.tradingsymbol
+                    last_tick = bot_instance.trader.last_option_tick_time.get(tsym)
+                    stale = (last_tick is None or
+                             (now_ist() - last_tick).total_seconds() > OPTION_STALE_SECS)
+                    if stale:
+                        try:
+                            q = bot_instance.kite.ltp([f"NFO:{tsym}"])
+                            rest_ltp = q.get(f"NFO:{tsym}", {}).get("last_price", 0.0)
+                            if rest_ltp > 0:
+                                bot_instance.trader.last_option_ltp[tsym] = rest_ltp
+                                bot_instance.trader.last_option_tick_time[tsym] = now_ist()
+                                add_log(f"📡 Option feed stale for {tsym} — refreshed via REST LTP: ₹{rest_ltp:.2f}")
+                        except Exception as rest_err:
+                            add_log(f"⚠️ REST LTP fallback failed for {tsym}: {rest_err}")
+                            try:
+                                if bot_instance.telegram:
+                                    bot_instance.telegram.send_message(
+                                        f"⚠️ <b>Option Feed Stale & REST Fallback Failed</b>\n\n"
+                                        f"<b>Symbol:</b> {tsym}\n"
+                                        f"<b>Error:</b> {rest_err}\n\n"
+                                        f"SL monitoring for this position may be compromised. "
+                                        f"Please check manually."
+                                    )
+                            except Exception:
+                                pass
+
+            # 3. Time-based forced square-off at 15:20 IST (safety net, with lock)
+            if now.hour == 15 and now.minute >= 20 and now.minute < 25:
+                with bot_instance.trader.lock:
+                    for pos in list(bot_instance.trader.positions):
+                        if getattr(pos, "orphaned", False):
+                            add_log(f"⚠️ ORPHANED {pos.tradingsymbol} — skipping 15:20 force close (still open at broker!)")
+                            continue
+                        add_log(f"⏰ Force-closing open NIFTY position {pos.tradingsymbol} at 15:20 (time-based safety)")
+                        try:
+                            # Resolve best available exit price — don't use entry_price
+                            eod_price = pos.entry_price  # fallback
+                            if pos.instrument == "OPTIONS":
+                                opt_ltp = bot_instance.trader.last_option_ltp.get(pos.tradingsymbol, 0.0)
+                                if opt_ltp > 0:
+                                    eod_price = opt_ltp
+                            elif pos.instrument == "FUTURES" and bot_instance.kite and pos.tradingsymbol != "NIFTY_FUT":
+                                try:
+                                    q = bot_instance.kite.ltp([f"NFO:{pos.tradingsymbol}"])
+                                    fut_ltp = q.get(f"NFO:{pos.tradingsymbol}", {}).get("last_price", 0.0)
+                                    if fut_ltp > 0:
+                                        eod_price = fut_ltp
+                                except Exception:
+                                    pass
+                            bot_instance.trader._close_position(pos, eod_price, "EOD_FORCE_CLOSE")
+                        except Exception as sq_err:
+                            add_log(f"Force square-off error: {sq_err}")
 
             # 4. EOD Summary at 15:31 IST (fires once, inside loop — survives loop exit or restart)
             if not eod_summary_sent and now.hour == 15 and now.minute >= 31:

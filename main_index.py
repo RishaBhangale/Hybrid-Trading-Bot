@@ -89,6 +89,10 @@ class IndexPosition:
         self.exit_reason = None
         self.pnl = 0.0
         self.net_pnl = 0.0
+        # Peak premium seen since entry — used to ratchet options trailing SL
+        self.peak_premium: float = entry_price
+        # Set True if exit order failed and position remains at broker
+        self.orphaned: bool = False
 
     def close(self, exit_price: float, reason: str):
         self.exit_price = exit_price
@@ -356,15 +360,15 @@ class IndexTrader:
         self.current_candle: Optional[Dict] = None
         self.last_candle_time: Optional[datetime] = None
         self.current_day: Optional[datetime.date] = None
-        
+
         self.orb_high = None
         self.orb_low = None
         self.orb_width = None
         self.orb_traded_today = False
-        
+
         self.positions: List[IndexPosition] = []
         self.closed_trades: List[IndexPosition] = []
-        
+
         # Telemetry
         self.tick_count = 0
         self.ltp = 0.0
@@ -373,7 +377,9 @@ class IndexTrader:
         self.last_ema200 = 0.0
         self.last_filter_reason = "Waiting for initial 15M candles"
         self.lock = Lock()
-        self.last_option_ltp: Dict[str, float] = {}  # Updated from WebSocket ticks
+        self.last_option_ltp: Dict[str, float] = {}       # Updated from WebSocket ticks
+        self.last_option_tick_time: Dict[str, datetime] = {}  # Timestamp of last tick per option (T2-E staleness)
+        self.nifty_fut_symbol: Optional[str] = None        # Set by load_market_metadata (T2-B)
         
     def process_tick(self, ltp: float, tick_time: datetime, volume: int = 0):
         with self.lock:
@@ -389,24 +395,35 @@ class IndexTrader:
                         self._process_candle(self.current_candle)
                 
                 self.current_candle = {
-                    "timestamp": candle_ts, "open": ltp, "high": ltp, "low": ltp, "close": ltp, "volume": volume
+                    "timestamp": candle_ts, "open": ltp, "high": ltp, "low": ltp, "close": ltp, "volume": 0
                 }
                 self.last_candle_time = candle_ts
+                self._prev_volume = volume  # Seed for next tick's delta computation
             else:
                 self.current_candle["high"] = max(self.current_candle["high"], ltp)
                 self.current_candle["low"] = min(self.current_candle["low"], ltp)
                 self.current_candle["close"] = ltp
-                self.current_candle["volume"] += volume
-                
+                # volume from Kite is CUMULATIVE day volume — store only the delta per tick
+                prev = getattr(self, "_prev_volume", 0)
+                delta = max(0, volume - prev) if volume >= prev else volume
+                self.current_candle["volume"] += delta
+                self._prev_volume = volume
+
             self._check_trailing_stops(ltp)
             
     def _check_trailing_stops(self, ltp: float):
         for pos in list(self.positions):
+            if getattr(pos, "orphaned", False):
+                continue  # Exit order already failed — skip, don't double-trigger
             if pos.instrument == "OPTIONS":
                 opt_ltp = self.last_option_ltp.get(pos.tradingsymbol, 0.0)
-                if opt_ltp > 0 and opt_ltp <= pos.trailing_sl:
-                    self.logger(f"🔔 [NIFTY SL] Option LTP ₹{opt_ltp:.2f} ≤ SL ₹{pos.trailing_sl:.2f}")
-                    self._close_position(pos, opt_ltp, "SL_HIT")
+                if opt_ltp > 0:
+                    # Ratchet peak premium up whenever we see a new high
+                    if opt_ltp > pos.peak_premium:
+                        pos.peak_premium = opt_ltp
+                    if opt_ltp <= pos.trailing_sl:
+                        self.logger(f"🔔 [NIFTY SL] Option LTP ₹{opt_ltp:.2f} ≤ SL ₹{pos.trailing_sl:.2f}")
+                        self._close_position(pos, opt_ltp, "SL_HIT")
             elif pos.instrument == "FUTURES":
                 if pos.position_type == "LONG" and ltp <= pos.trailing_sl:
                     self._close_position(pos, pos.trailing_sl, "SL_HIT")
@@ -420,8 +437,7 @@ class IndexTrader:
         c_close = candle["close"]
         c_high = candle["high"]
         c_low = candle["low"]
-        c_vol = candle["volume"]
-        
+
         # New Day Reset
         if self.current_day != c_day:
             self.current_day = c_day
@@ -429,7 +445,7 @@ class IndexTrader:
             self.orb_low = None
             self.orb_width = None
             self.orb_traded_today = False
-            
+
         # 15M ORB (09:15 - 09:30)
         if c_time.hour == 9 and c_time.minute == 15:
             self.orb_high = candle["high"]
@@ -437,9 +453,14 @@ class IndexTrader:
             self.orb_width = self.orb_high - self.orb_low
             self.logger(f"🎯 15M ORB Established: High={self.orb_high:.1f}, Low={self.orb_low:.1f}, Width={self.orb_width:.1f} pts")
             return
-            
+
         # Calculate Technical Indicators
-        df = pd.DataFrame(self.candles[-50:])
+        # Use up to 260 candles (~65 trading days) so EMA-200 has valid seed data.
+        # Require >=200 candles before computing — with fewer bars EMA-200 is meaningless.
+        df = pd.DataFrame(self.candles[-260:])
+        if len(df) < 200:
+            self.last_filter_reason = f"Waiting for 200-candle history for valid EMA-200 (have {len(df)})"
+            return
         hl = df['high'] - df['low']
         hc = (df['high'] - df['close'].shift(1)).abs()
         lc = (df['low'] - df['close'].shift(1)).abs()
@@ -449,42 +470,41 @@ class IndexTrader:
         self.last_ema200 = df['close'].ewm(span=200, adjust=False).mean().iloc[-1]
         don_high = df['high'].iloc[-21:-1].max() if len(df) >= 21 else df['high'].max()
         don_low = df['low'].iloc[-21:-1].min() if len(df) >= 21 else df['low'].min()
-        vol_ma = df['volume'].iloc[-21:-1].mean() if len(df) >= 21 else df['volume'].mean()
-        
+
         # 1. Update Trailing SLs on Closed Candle
         for pos in self.positions:
+            if getattr(pos, "orphaned", False):
+                continue
             if pos.strategy == "1B_ORB_OPTIONS":
-                pos.trailing_sl = max(pos.trailing_sl, pos.entry_price * 0.75)
+                # Ratchet off peak_premium (highest LTP seen since entry), not entry_price.
+                # This ensures winners actually protect profits — the old entry_price * 0.75
+                # was a permanent no-op that reset the stop to the same level every candle.
+                pos.trailing_sl = max(pos.trailing_sl, pos.peak_premium * 0.75)
             elif pos.strategy == "2_FUTURES_TREND":
                 if pos.position_type == "LONG":
                     pos.trailing_sl = max(pos.trailing_sl, c_high - (2.0 * self.last_atr))
                 elif pos.position_type == "SHORT":
                     pos.trailing_sl = min(pos.trailing_sl, c_low + (2.0 * self.last_atr))
 
-        # 2. Intraday Auto Square-Off at 15:15
-        if c_time >= datetime.strptime("15:15", "%H:%M").time():
-            for pos in list(self.positions):
-                self._close_position(pos, c_close, "EOD_SQUAREOFF")
-            return
-
-        # 3. Strategy 1B: Filtered 15M ORB Evaluation (09:30 to 14:00)
+        # 2. Strategy 1B: Filtered 15M ORB Evaluation (09:30 to 14:00)
+        # Note: vol_ok filter removed — NIFTY 50 index volume from Kite ticks is always 0,
+        # making the 1.2x MA volume filter a permanent pass-through with misleading logs.
         if STRATEGY_MODE in ["ORB_OPTIONS", "HYBRID"] and not self.orb_traded_today and self.orb_high is not None:
             if datetime.strptime("09:30", "%H:%M").time() <= c_time <= datetime.strptime("14:00", "%H:%M").time():
-                vol_ok = (c_vol > 1.2 * vol_ma) if (vol_ma > 0 and c_vol > 0) else True
                 width_ok = (0.20 * self.last_atr <= self.orb_width <= 0.65 * self.last_atr)
-                
+
                 # LONG ORB Breakout (BUY ATM CALL)
-                if c_close > self.orb_high and vol_ok and width_ok and (c_close > self.last_ema200):
+                if c_close > self.orb_high and width_ok and (c_close > self.last_ema200):
                     self._enter_options_position("CALL", c_close)
                     self.orb_traded_today = True
                     self.last_filter_reason = "1B ORB Long Call Executed"
-                elif c_close < self.orb_low and vol_ok and width_ok and (c_close < self.last_ema200):
+                elif c_close < self.orb_low and width_ok and (c_close < self.last_ema200):
                     self._enter_options_position("PUT", c_close)
                     self.orb_traded_today = True
                     self.last_filter_reason = "1B ORB Short Put Executed"
                 else:
-                    if not width_ok: self.last_filter_reason = f"ORB Width {self.orb_width:.1f} outside ATR bounds"
-                    elif not vol_ok: self.last_filter_reason = "Volume below 1.2x MA"
+                    if not width_ok:
+                        self.last_filter_reason = f"ORB Width {self.orb_width:.1f} outside ATR bounds"
 
         # 4. Strategy 2: Futures Trend Following (09:30 to 14:30)
         if STRATEGY_MODE in ["FUTURES_TREND", "HYBRID"]:
@@ -498,18 +518,31 @@ class IndexTrader:
                             if self.telegram and (self.capital_tracker.session_capital < self.capital_tracker.futures_min_capital or self.capital_tracker.session_capital <= 0):
                                 self.telegram.notify_capital_alert("NIFTY FUTURES", self.capital_tracker.session_capital, self.capital_tracker.futures_min_capital, self.capital_tracker.overall_pnl, reason)
                             return
-                    sl = c_close - (2.0 * self.last_atr)
-                    entry_p = c_close
+
+                    # Use live futures LTP for entry price — spot and futures diverge by 50-150pts
+                    fut_sym = getattr(self, "nifty_fut_symbol", None)
+                    entry_p = c_close  # fallback
+                    if fut_sym and self.kite:
+                        try:
+                            fut_quote = self.kite.ltp([f"NFO:{fut_sym}"])
+                            fut_ltp = fut_quote.get(f"NFO:{fut_sym}", {}).get("last_price", 0.0)
+                            if fut_ltp > 0:
+                                entry_p = fut_ltp
+                        except Exception as eq:
+                            self.logger(f"⚠️ [NIFTY Futures LONG] Could not fetch futures LTP, using spot: {eq}")
+
+                    tradingsymbol = fut_sym or "NIFTY_FUT"
+                    sl = entry_p - (2.0 * self.last_atr)
                     qty = self.lot_size
                     if self.execution_engine:
-                        res = self.execution_engine.place_entry_order("NIFTY_FUT", qty, entry_p, "BUY")
+                        res = self.execution_engine.place_entry_order(tradingsymbol, qty, entry_p, "BUY")
                         if res["status"] != "COMPLETE":
                             self.logger(f"❌ [NIFTY Futures LONG] Order failed: {res.get('error', res['status'])}")
                             return
                         entry_p = res["fill_price"]
                         qty = res.get("fill_qty", qty)
 
-                    pos = IndexPosition("2_FUTURES_TREND", "LONG", "FUTURES", "NIFTY_FUT", entry_p, sl, qty, c_ts, c_close)
+                    pos = IndexPosition("2_FUTURES_TREND", "LONG", "FUTURES", tradingsymbol, entry_p, sl, qty, c_ts, c_close)
                     self.positions.append(pos)
                     self._notify_entry(pos, f"NIFTY Futures LONG (EMA Bull + Donchian Breakout > {don_high:.1f})")
                 elif self.last_ema50 < self.last_ema200 and c_close < don_low:
@@ -520,18 +553,31 @@ class IndexTrader:
                             if self.telegram and (self.capital_tracker.session_capital < self.capital_tracker.futures_min_capital or self.capital_tracker.session_capital <= 0):
                                 self.telegram.notify_capital_alert("NIFTY FUTURES", self.capital_tracker.session_capital, self.capital_tracker.futures_min_capital, self.capital_tracker.overall_pnl, reason)
                             return
-                    sl = c_close + (2.0 * self.last_atr)
-                    entry_p = c_close
+
+                    # Use live futures LTP for entry price
+                    fut_sym = getattr(self, "nifty_fut_symbol", None)
+                    entry_p = c_close  # fallback
+                    if fut_sym and self.kite:
+                        try:
+                            fut_quote = self.kite.ltp([f"NFO:{fut_sym}"])
+                            fut_ltp = fut_quote.get(f"NFO:{fut_sym}", {}).get("last_price", 0.0)
+                            if fut_ltp > 0:
+                                entry_p = fut_ltp
+                        except Exception as eq:
+                            self.logger(f"⚠️ [NIFTY Futures SHORT] Could not fetch futures LTP, using spot: {eq}")
+
+                    tradingsymbol = fut_sym or "NIFTY_FUT"
+                    sl = entry_p + (2.0 * self.last_atr)
                     qty = self.lot_size
                     if self.execution_engine:
-                        res = self.execution_engine.place_entry_order("NIFTY_FUT", qty, entry_p, "SELL")
+                        res = self.execution_engine.place_entry_order(tradingsymbol, qty, entry_p, "SELL")
                         if res["status"] != "COMPLETE":
                             self.logger(f"❌ [NIFTY Futures SHORT] Order failed: {res.get('error', res['status'])}")
                             return
                         entry_p = res["fill_price"]
                         qty = res.get("fill_qty", qty)
 
-                    pos = IndexPosition("2_FUTURES_TREND", "SHORT", "FUTURES", "NIFTY_FUT", entry_p, sl, qty, c_ts, c_close)
+                    pos = IndexPosition("2_FUTURES_TREND", "SHORT", "FUTURES", tradingsymbol, entry_p, sl, qty, c_ts, c_close)
                     self.positions.append(pos)
                     self._notify_entry(pos, f"NIFTY Futures SHORT (EMA Bear + Donchian Breakdown < {don_low:.1f})")
 
@@ -563,6 +609,32 @@ class IndexTrader:
             self.logger(f"⚠️ [NIFTY ATM {opt_type}] LTP unavailable for {tsym} — aborting entry (refusing to fabricate price)")
             return
         
+        # T3-D: Quick margin sanity check before submitting order.
+        # Options require premium upfront; verify available cash margin is adequate.
+        required_margin = live_price * lot * 1.10  # 10% buffer over raw premium
+        if self.execution_engine and not self.execution_engine.paper_trading and self.kite:
+            try:
+                margins = self.kite.margins(segment=self.kite.MARGIN_NFO)
+                available = float(margins.get("net", 0.0) or 0.0)
+                if available < required_margin:
+                    self.logger(
+                        f"⚠️ [NIFTY ATM {opt_type}] Insufficient margin for {tsym} — "
+                        f"need ₹{required_margin:,.0f}, have ₹{available:,.0f}. Aborting entry."
+                    )
+                    if self.telegram:
+                        try:
+                            self.telegram.send_message(
+                                f"⚠️ <b>Entry Blocked: Insufficient Margin</b>\n\n"
+                                f"<b>Symbol:</b> {tsym}\n"
+                                f"<b>Required:</b> ₹{required_margin:,.0f}\n"
+                                f"<b>Available:</b> ₹{available:,.0f}"
+                            )
+                        except Exception:
+                            pass
+                    return
+            except Exception as me:
+                self.logger(f"⚠️ [NIFTY ATM {opt_type}] Could not check margins: {me} — proceeding anyway")
+
         # Execute via ExecutionEngine
         if self.execution_engine:
             res = self.execution_engine.place_entry_order(tsym, lot, live_price, "BUY")
@@ -728,6 +800,7 @@ class IndexOptionsBot:
         self.telegram = TelegramNotifier() if TELEGRAM_AVAILABLE else None
         self.nfo_df: Optional[pd.DataFrame] = None
         self.spot_token = 256265
+        self.nifty_fut_symbol: Optional[str] = None  # Nearest-expiry NIFTY futures tradingsymbol
         self.token_to_symbol: Dict[int, str] = {self.spot_token: "NIFTY"}
         self._needs_restart = False
         self._needs_reauth = False
@@ -774,14 +847,14 @@ class IndexOptionsBot:
         return False
 
     def load_market_metadata(self):
-        """Load live NIFTY spot token and NFO lot size from Kite API."""
+        """Load live NIFTY spot token, lot size, and nearest futures contract from Kite API."""
         if not self.kite: return
         self._log("📊 Downloading live NIFTY market metadata (NSE & NFO)...")
-        
+
         # 1. Download NFO
         nfo_list = self.kite.instruments('NFO')
         self.nfo_df = pd.DataFrame(nfo_list)
-        
+
         # 2. Download NSE
         nse_list = self.kite.instruments('NSE')
         df_nse = pd.DataFrame(nse_list)
@@ -789,26 +862,34 @@ class IndexOptionsBot:
         if not spot_match.empty:
             self.spot_token = int(spot_match.iloc[0]['instrument_token'])
             self.token_to_symbol[self.spot_token] = "NIFTY"
-            
-        nifty_futs = self.nfo_df[(self.nfo_df['name'] == 'NIFTY') & (self.nfo_df['instrument_type'] == 'FUT')]
+
+        # 3. Resolve nearest-expiry NIFTY futures contract and store tradingsymbol.
+        #    Futures entries must use futures LTP, not spot price — they trade 50-150 pts apart.
+        nifty_futs = self.nfo_df[
+            (self.nfo_df['name'] == 'NIFTY') & (self.nfo_df['instrument_type'] == 'FUT')
+        ].sort_values('expiry')
         if not nifty_futs.empty:
             self.trader.lot_size = int(nifty_futs.iloc[0]['lot_size'])
-            
+            self.nifty_fut_symbol = nifty_futs.iloc[0]['tradingsymbol']
+            self.trader.nifty_fut_symbol = self.nifty_fut_symbol
+
         self.trader.kite = self.kite
         self.trader.nfo_df = self.nfo_df
-        self._log(f"   ✓ NIFTY Spot Token: {self.spot_token} | Current Lot Size: {self.trader.lot_size}")
+        self._log(f"   ✓ NIFTY Spot Token: {self.spot_token} | Lot Size: {self.trader.lot_size} | Futures: {self.nifty_fut_symbol}")
 
     def fetch_historical(self):
         if not self.kite: return
-        self._log("📊 Fetching historical 15M NIFTY candles...")
+        self._log("📊 Fetching historical 15M NIFTY candles (60-day window for valid EMA-200)...")
         to_d = now_ist()
-        from_d = to_d - timedelta(days=10)
+        from_d = to_d - timedelta(days=60)  # 10 days → 60 days; need >=200 candles for EMA-200
         data = self.kite.historical_data(self.spot_token, from_date=from_d, to_date=to_d, interval="15minute")
         self.trader.candles = []  # Clear on retry to avoid duplicates
-        for c in data[-50:]:
+        for c in data[-260:]:   # Keep last 260 candles (~65 trading days × ~4 candles/hr)
             self.trader.candles.append({
-                "timestamp": c["date"], "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"], "volume": c.get("volume", 0)
+                "timestamp": c["date"], "open": c["open"], "high": c["high"],
+                "low": c["low"], "close": c["close"], "volume": c.get("volume", 0)
             })
+        self._log(f"   ✓ Loaded {len(self.trader.candles)} historical 15M candles")
 
     def start_live_feed(self):
         creds = load_credentials()
@@ -828,6 +909,7 @@ class IndexOptionsBot:
             
         def on_ticks(ws, ticks):
             self._last_tick_time = now_ist()
+            now = now_ist()
             for t in ticks:
                 tok = t.get("instrument_token")
                 if tok in self.token_to_symbol:
@@ -838,8 +920,9 @@ class IndexOptionsBot:
                         opt_tsym = sym[4:]
                         if ltp:
                             self.trader.last_option_ltp[opt_tsym] = ltp
+                            self.trader.last_option_tick_time[opt_tsym] = now
                     elif sym == "NIFTY" and ltp:
-                        self.trader.process_tick(ltp, now_ist(), vol)
+                        self.trader.process_tick(ltp, now, vol)
 
         def on_error(ws, code, reason):
             err_msg = f"[{code}] {reason}"
@@ -948,6 +1031,7 @@ class IndexOptionsBot:
 
         def on_ticks(ws, ticks):
             self._last_tick_time = now_ist()
+            now = now_ist()
             for t in ticks:
                 tok = t.get("instrument_token")
                 if tok in self.token_to_symbol:
@@ -958,8 +1042,9 @@ class IndexOptionsBot:
                         opt_tsym = sym[4:]
                         if ltp:
                             self.trader.last_option_ltp[opt_tsym] = ltp
+                            self.trader.last_option_tick_time[opt_tsym] = now
                     elif sym == "NIFTY" and ltp:
-                        self.trader.process_tick(ltp, now_ist(), vol)
+                        self.trader.process_tick(ltp, now, vol)
 
         def on_error(ws, code, reason):
             err_msg = f"[{code}] {reason}"
@@ -1021,27 +1106,46 @@ class IndexOptionsBot:
 
     def generate_report(self):
         today = now_ist().strftime("%Y-%m-%d")
-        # Ensure any remaining open positions are force-closed so their P&L enters EOD accounting
-        for pos in list(self.trader.positions):
-            self._log(f"⚠️ Force-closing open NIFTY position {pos.tradingsymbol} before EOD report")
-            try:
-                self.trader._close_position(pos, pos.entry_price, "EOD_REPORT_CLOSE")
-            except Exception as e:
-                self._log(f"❌ Failed to close {pos.tradingsymbol} before EOD report: {e}")
+        # Force-close any remaining open positions and P&L-account them before generating report.
+        # Use trader.lock to prevent a race with the WebSocket tick thread.
+        with self.trader.lock:
+            for pos in list(self.trader.positions):
+                if getattr(pos, "orphaned", False):
+                    self._log(f"⚠️ ORPHANED position {pos.tradingsymbol} — skipping EOD close (still open at broker!)")
+                    continue
+                self._log(f"⚠️ Force-closing open NIFTY position {pos.tradingsymbol} before EOD report")
+                try:
+                    # Resolve best available exit price — don't use entry_price for EOD accounting
+                    eod_price = pos.entry_price  # fallback
+                    if pos.instrument == "OPTIONS":
+                        opt_ltp = self.trader.last_option_ltp.get(pos.tradingsymbol, 0.0)
+                        if opt_ltp > 0:
+                            eod_price = opt_ltp
+                    elif pos.instrument == "FUTURES" and self.kite and pos.tradingsymbol != "NIFTY_FUT":
+                        try:
+                            q = self.kite.ltp([f"NFO:{pos.tradingsymbol}"])
+                            fut_ltp = q.get(f"NFO:{pos.tradingsymbol}", {}).get("last_price", 0.0)
+                            if fut_ltp > 0:
+                                eod_price = fut_ltp
+                        except Exception:
+                            pass
+                    self.trader._close_position(pos, eod_price, "EOD_REPORT_CLOSE")
+                except Exception as e:
+                    self._log(f"❌ Failed to close {pos.tradingsymbol} before EOD report: {e}")
 
         trades = self.trader.closed_trades
         tot_pnl = sum(t.net_pnl for t in trades)
         wins = [t for t in trades if t.net_pnl > 0]
-        
+
         diagnostics = {"NIFTY": self.trader.get_diagnostics()}
-        
+
         # Process EOD Capital and Risk
         cap_summary = self.capital_tracker.end_day(tot_pnl)
-        
+
         if self.telegram:
             sec_data = {"NIFTY": {"trades": len(trades), "pnl": tot_pnl, "wins": len(wins), "losses": len(trades) - len(wins)}}
             self.telegram.notify_daily_summary(today, sec_data, tot_pnl, diagnostics=diagnostics, capital_summary=cap_summary)
-            
+
         rep = {
             "date": today,
             "strategy": STRATEGY_MODE,
